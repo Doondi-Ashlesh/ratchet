@@ -81,3 +81,42 @@ real bug becomes type-checker-approved.
 **class fix** — Split into ANNOTATION (mechanical, agent may attempt) and DEFECT
 (escalate to a human). Route on **what mypy is asserting**, not on whether an
 edit is possible.
+
+---
+
+## 006 · Fixing config changes what is visible, not only what is wrong
+
+**observed** — Installed pydantic stubs against SdkAgent. config 17→13,
+cascading 7→3, annotation 87→84, **unknown 0→2**. Total 111→102.
+
+The two new errors were `arg-type` in `contracts.py`. Nothing in the source
+changed — only a package was installed. Those errors had always existed and were
+invisible while mypy could not resolve pydantic.
+
+**root cause** — mypy under-reports when an import fails; it cannot analyze what
+depends on an unresolvable module. So a config fix alters the *denominator*, not
+just the numerator.
+
+**class fix** — `judge()` cannot be a subtraction. A CONFIG session is accepted on
+config falling, with a rising total allowed, because appearing errors are reveals
+rather than regressions. Stated honestly: reveals are proven to occur, their
+magnitude is unbounded but unmeasured — here removals won 9 to 2. Bound it by
+installing the remaining 13 stubs before the agent depends on this.
+
+---
+
+## 007 · Some codes are irreducibly ambiguous; route them by cost asymmetry
+
+**observed** — Both revealed errors were `arg-type`: pydantic's
+`list[ErrorDetails]` passed where `list[dict[str, Any]]` was declared. The code is
+correct at runtime — `list` is invariant, so the *annotation* is too narrow. But
+`arg-type` is also exactly how a genuinely wrong call reports itself.
+
+**root cause** — mypy cannot distinguish "your annotation is too tight" from "your
+call is wrong". Neither can a classifier reading the code alone.
+
+**class fix** — Route by consequence, not by likelihood. A real bug sent to the
+agent is silenced with a cast, permanently. An over-narrow annotation sent to a
+human costs thirty seconds. So `arg-type` → DEFECT. Volume checked before
+committing: 5 defects across 375 errors, 1.3%. Revisit if that grows — the answer
+is a function of volume, not principle alone.
