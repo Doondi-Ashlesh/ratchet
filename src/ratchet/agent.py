@@ -71,6 +71,23 @@ def _unfence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _normalize(text: str, like: str) -> str:
+    """Match the original file's line endings and trailing newline.
+
+    A model returns whatever endings it feels like. Writing those verbatim turns a
+    three-line annotation fix into a whole-file diff, and drops the final newline
+    that end-of-file-fixer exists to protect. Normalising here means `changed`
+    compares content rather than formatting.
+    """
+    body = text.replace("\r\n", "\n").replace("\r", "\n")
+    newline = "\r\n" if "\r\n" in like else "\n"
+    if newline != "\n":
+        body = body.replace("\n", newline)
+    if like.endswith(("\n", "\r")) and not body.endswith(newline):
+        body += newline
+    return body
+
+
 def propose(path: str, diagnostics: Sequence[Classified]) -> Proposal:
     """Ask the model for a corrected version of `path`.
 
@@ -93,14 +110,16 @@ def propose(path: str, diagnostics: Sequence[Classified]) -> Proposal:
         f"--- BEGIN {path} ---\n{original}\n--- END {path} ---\n"
     )
 
-    proposed = _unfence(model.complete(prompt))
-    if not proposed:
+    proposed = _normalize(_unfence(model.complete(prompt)), like=original)
+    if not proposed.strip():
         return Proposal(path, original, "", changed=False, note="model returned nothing")
 
-    return Proposal(
-        path=path,
-        original=original,
-        proposed=proposed,
-        changed=proposed.strip() != original.strip(),
-        note="" if proposed.strip() != original.strip() else "model returned the file unchanged",
-    )
+    if proposed == original:
+        # Exact comparison is meaningful now that both sides use the file's own
+        # conventions. Before normalising, a byte-identical answer in different
+        # line endings read as a change and cost a whole measure-and-reject cycle.
+        return Proposal(
+            path, original, proposed, changed=False, note="model returned the file unchanged"
+        )
+
+    return Proposal(path=path, original=original, proposed=proposed, changed=True)

@@ -120,3 +120,96 @@ agent is silenced with a cast, permanently. An over-narrow annotation sent to a
 human costs thirty seconds. So `arg-type` → DEFECT. Volume checked before
 committing: 5 defects across 375 errors, 1.3%. Revisit if that grows — the answer
 is a function of volume, not principle alone.
+
+---
+
+## 008 · Two of five model ids in SdkAgent do not exist
+
+**observed** — Live call 404'd. `nvidia/nemotron-3-super-120b` is not a real
+id; the endpoint serves `nvidia/nemotron-3-super-120b-a12b`. Also
+`nvidia/nemotron-3-ultra` → `nvidia/nemotron-3-ultra-550b-a55b`. Only the
+nano id was correct.
+
+**root cause** — Ids were written from memory and never exercised. Every
+SdkAgent test injects a mock, so the wiring was proven and the world never
+was. A live `/solve` would 404 at PLAN.
+
+**class fix** — A hardcoded id will go stale again; correcting it is the
+instance fix. The class fix is legibility: the client can already list
+`/models`, so a 404 should answer "not found — did you mean X?" rather than
+"404 page not found".
+
+---
+
+## 009 · The model routed around the prompt rule instead of breaking it
+
+**observed** — First live proposal changed `-> dict` to
+`-> dict[object, object]`. The prompt forbade `Any`; the model used `object`,
+which is equally vacuous. Worse, `dict` is invariant, so it introduces a
+`return-value` error — net zero errors, and the new one is a defect class.
+
+**root cause** — A prompt is a request. The model complied with the letter of
+the rule and discarded its purpose, which no wording prevents.
+
+**class fix** — Enforcement must be a deterministic check. The gate already
+rejects this via total-must-decrease, but a guard should name it specifically:
+vacuous annotations (`Any`, `object`, `dict[Any, Any]`) are a suppression in
+disguise and should be rejected with the reason, so the next attempt gets told
+what was wrong.
+
+---
+
+## 010 · read + write silently rewrote every line ending
+
+**observed** — After a rejected session, `git status` showed knowledge.py as
+modified while `git diff` was empty and the blob hashes matched. Chasing it
+found that `read_file` → `write_file` converts `b"a = 1\nb = 2\n"` into
+`b"a = 1\r\nb = 2\r\n"`.
+
+**root cause** — `Path.read_text` / `write_text` do newline translation in text
+mode. The revert appeared correct only because SdkAgent's working tree is
+already CRLF; on an LF repo the "restore" would have differed on every line.
+
+**class fix** — `newline=""` on both, so the tools move bytes rather than
+interpreting them. Test asserts byte-exact round-trip for LF and CRLF inputs.
+Fixed in the same pass: the model's proposal is normalised to the file's own
+endings and trailing newline before comparison, so `changed` reflects content
+rather than formatting. Before that, a byte-identical answer in LF read as a
+change and cost a full write-measure-reject cycle.
+
+---
+
+## 011 · mypy's cache leaked results between unrelated targets
+
+**observed** — A session on `<tmp-a>/a.py` received diagnostics whose `file`
+field pointed at `<tmp-b>/a.py`. The per-file filter matched nothing, so the
+session reported "no annotation work" on a file that plainly had some.
+
+**root cause** — mypy's incremental cache lives in the working directory and keys
+modules by *name*. Two unrelated targets each containing a module called `a`
+share cache entries, and the second run receives the first one's results —
+complete with the first one's paths.
+
+**class fix** — `--cache-dir` per target, keyed by a hash of the resolved path.
+Isolation without giving up incrementality. Surfaced by test isolation, but the
+real exposure was production: measuring two repos from one working directory
+could cross-contaminate, and a ratchet is worth nothing if the measurement is not
+trustworthy. Cost is a cold cache per target — suite time went 9s to 22s.
+
+---
+
+## 012 · run_mypy depended on PATH
+
+**observed** — Running the suite through `.venv/Scripts/python.exe` without
+activating the venv made every mypy-invoking test fail with
+`mypy_not_installed`.
+
+**root cause** — `subprocess.run(["mypy", ...])` resolves by PATH lookup, so the
+tool worked or not depending on which shell invoked it. Same class as the empty
+`C:\Windows\System32\git` file that shadowed real git for anything using
+subprocess.
+
+**class fix** — `[sys.executable, "-m", "mypy", ...]`, which resolves to the
+running interpreter's own environment regardless of PATH. Known limitation: this
+pins mypy to *Ratchet's* environment, so checking a repo with its own venv and
+its own stubs will need that repo's interpreter instead. Not a problem yet.
