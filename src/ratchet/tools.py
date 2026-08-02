@@ -8,8 +8,11 @@ trace; `{"ok": false, "error_type": "file_not_found"}` gives it a decision.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
+import sys
+import tempfile
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -43,7 +46,8 @@ def read_file(path: str) -> ToolResult:
     if not p.is_file():
         return ToolResult(False, error_type="file_not_found", error_message=str(p))
     try:
-        return ToolResult(True, {"path": str(p), "content": p.read_text(encoding="utf-8")})
+        with p.open("r", encoding="utf-8", newline="") as f:
+            return ToolResult(True, {"path": str(p), "content": f.read()})
     except UnicodeDecodeError as e:
         return ToolResult(False, error_type="not_text", error_message=str(e))
 
@@ -54,7 +58,8 @@ def write_file(path: str, content: str) -> ToolResult:
         # Deliberately refuses to create files. This agent edits what exists;
         # inventing new modules is a much larger permission than fixing a type.
         return ToolResult(False, error_type="file_not_found", error_message=str(p))
-    p.write_text(content, encoding="utf-8")
+    with p.open("w", encoding="utf-8", newline="") as f:
+        f.write(content)
     return ToolResult(True, {"path": str(p), "bytes": len(content)})
 
 
@@ -66,8 +71,26 @@ def run_mypy(target: str, strict: bool = True) -> ToolResult:
     Uses --output=json rather than scraping human output. Regex-parsing a tool that
     can emit structured data is a bug waiting for the first Windows path with a
     colon in it. Prefer the machine format whenever a tool offers one.
+
+    Invoked as `sys.executable -m mypy` rather than bare `mypy`, so it resolves to
+    the interpreter's own environment instead of whatever PATH happens to hold.
     """
-    cmd = ["mypy", "--output=json", "--no-error-summary"]
+    # Per-target cache. mypy keys modules by NAME and its default cache lives in the
+    # working directory, so two unrelated targets that both contain `a.py` collide
+    # and the second run receives the first one's diagnostics — complete with the
+    # first one's file paths. A harness whose whole premise is a trustworthy
+    # measurement cannot share that cache.
+    fingerprint = hashlib.sha256(str(Path(target).resolve()).encode()).hexdigest()[:16]
+    cache_dir = Path(tempfile.gettempdir()) / "ratchet-mypy-cache" / fingerprint
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "mypy",
+        "--output=json",
+        "--no-error-summary",
+        f"--cache-dir={cache_dir}",
+    ]
     if strict:
         cmd.append("--strict")
     cmd.append(target)

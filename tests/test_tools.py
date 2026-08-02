@@ -18,9 +18,16 @@ CLEAN = "def f(x: int) -> int:\n    return x\n"
 UNTYPED = "def f(x):\n    return x\n"
 
 
+def _write(p: Path, text: str) -> None:
+    """Write exactly these bytes. write_text() translates \\n to \\r\\n on Windows,
+    so the fixture would not contain what it claims to contain."""
+    with p.open("w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
 def test_read_file_returns_content(tmp_path: Path) -> None:
     p = tmp_path / "a.py"
-    p.write_text(CLEAN, encoding="utf-8")
+    _write(p, CLEAN)
 
     r = tools.read_file(str(p))
 
@@ -39,7 +46,7 @@ def test_read_missing_file_is_data_not_an_exception(tmp_path: Path) -> None:
 
 def test_write_file_updates_an_existing_file(tmp_path: Path) -> None:
     p = tmp_path / "a.py"
-    p.write_text(UNTYPED, encoding="utf-8")
+    _write(p, UNTYPED)
 
     r = tools.write_file(str(p), CLEAN)
 
@@ -60,7 +67,7 @@ def test_write_file_refuses_to_create(tmp_path: Path) -> None:
 
 
 def test_run_mypy_reports_zero_on_clean_source(tmp_path: Path) -> None:
-    (tmp_path / "clean.py").write_text(CLEAN, encoding="utf-8")
+    _write((tmp_path / "clean.py"), CLEAN)
 
     r = tools.run_mypy(str(tmp_path))
 
@@ -70,7 +77,7 @@ def test_run_mypy_reports_zero_on_clean_source(tmp_path: Path) -> None:
 
 
 def test_run_mypy_surfaces_the_error_code_and_message(tmp_path: Path) -> None:
-    (tmp_path / "bad.py").write_text(UNTYPED, encoding="utf-8")
+    _write((tmp_path / "bad.py"), UNTYPED)
 
     r = tools.run_mypy(str(tmp_path))
 
@@ -86,7 +93,7 @@ def test_run_mypy_surfaces_the_error_code_and_message(tmp_path: Path) -> None:
 def test_ok_means_the_tool_ran_not_that_the_code_is_clean(tmp_path: Path) -> None:
     """Pinning the semantic. Finding 111 errors is a successful run of the tool.
     `ok=False` is reserved for the tool failing to produce an answer at all."""
-    (tmp_path / "bad.py").write_text(UNTYPED, encoding="utf-8")
+    _write((tmp_path / "bad.py"), UNTYPED)
 
     r = tools.run_mypy(str(tmp_path))
 
@@ -115,17 +122,29 @@ def test_tally_counts_and_orders_by_frequency() -> None:
     assert tools._tally(["a", "b", "a", "c", "a", "b"]) == {"a": 3, "b": 2, "c": 1}
     assert tools._tally([]) == {}
 
+
 def test_run_mypy_groups_errors_by_file_worst_first(tmp_path: Path) -> None:
     """by_file is how a session picks which file to work on next, so the
     ordering is part of the contract, not a presentation detail."""
-    (tmp_path / "one.py").write_text(UNTYPED, encoding="utf-8")
-    (tmp_path / "three.py").write_text(
-        "def a(x):\n    return x\ndef b(x):\n    return x\ndef c(x):\n    return x\n",
-        encoding="utf-8",
-    )
+    _write((tmp_path / "one.py"), UNTYPED)
+    _write((tmp_path / "three.py"), "def a(x):\n    return x\ndef b(x):\n    return x\ndef c(x):\n    return x\n")
 
     by_file = tools.run_mypy(str(tmp_path)).data["by_file"]
 
     assert len(by_file) == 2
     assert list(by_file.values()) == sorted(by_file.values(), reverse=True)
     assert "three.py" in next(iter(by_file))
+
+
+def test_read_then_write_is_byte_exact(tmp_path: Path) -> None:
+    """A revert must restore the file, not a line-ending-normalised lookalike.
+    Without newline="" this rewrites every line on Windows, and the session's
+    safety property becomes conditional on which OS wrote the repo."""
+    for original in (b"a = 1\nb = 2\n", b"a = 1\r\nb = 2\r\n"):
+        p = tmp_path / "f.py"
+        p.write_bytes(original)
+
+        result = tools.write_file(str(p), str(tools.read_file(str(p)).data["content"]))
+
+        assert result.ok
+        assert p.read_bytes() == original

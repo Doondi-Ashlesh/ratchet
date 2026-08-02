@@ -38,7 +38,7 @@ def set_completer(fn: Completer | None) -> None:
 
 
 def model_id() -> str:
-    return os.environ.get("RATCHET_MODEL", "nvidia/nemotron-3-super-120b")
+    return os.environ.get("RATCHET_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 
 
 def _base_url() -> str:
