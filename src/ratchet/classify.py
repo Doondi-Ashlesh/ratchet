@@ -60,6 +60,8 @@ _DEFECT = frozenset(
         "attr-defined",        # accessing something that may not exist
         "func-returns-value",  # using the result of a function returning None
         "assignment",          # the annotation and the value genuinely disagree
+        "arg-type",            # ambiguous: a too-narrow annotation OR a genuinely
+                               # wrong call. mypy can't tell you which, so a human does.
     }
 )
 _CONFIG = frozenset({"import-not-found", "import-untyped"})
