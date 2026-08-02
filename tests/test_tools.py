@@ -114,3 +114,18 @@ def test_a_missing_mypy_binary_is_a_typed_error(
 def test_tally_counts_and_orders_by_frequency() -> None:
     assert tools._tally(["a", "b", "a", "c", "a", "b"]) == {"a": 3, "b": 2, "c": 1}
     assert tools._tally([]) == {}
+
+def test_run_mypy_groups_errors_by_file_worst_first(tmp_path: Path) -> None:
+    """by_file is how a session picks which file to work on next, so the
+    ordering is part of the contract, not a presentation detail."""
+    (tmp_path / "one.py").write_text(UNTYPED, encoding="utf-8")
+    (tmp_path / "three.py").write_text(
+        "def a(x):\n    return x\ndef b(x):\n    return x\ndef c(x):\n    return x\n",
+        encoding="utf-8",
+    )
+
+    by_file = tools.run_mypy(str(tmp_path)).data["by_file"]
+
+    assert len(by_file) == 2
+    assert list(by_file.values()) == sorted(by_file.values(), reverse=True)
+    assert "three.py" in next(iter(by_file))

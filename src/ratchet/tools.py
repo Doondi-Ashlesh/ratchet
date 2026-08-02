@@ -118,4 +118,4 @@ def _tally(values: Iterable[str]) -> dict[str, int]:
     out: dict[str, int] = {}
     for v in values:
         out[v] = out.get(v, 0) + 1
-    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+    return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
