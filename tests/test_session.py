@@ -82,6 +82,12 @@ def test_a_sideways_fix_is_reverted_byte_for_byte(tmp_path: Path) -> None:
 
     assert result.kept is False
     assert p.read_bytes() == before
+    # A rejected attempt is evidence. Discarding it leaves nobody able to say what
+    # the model actually wrote, which is what the next session needs to be told.
+    # Compared with endings normalised: the fixture is CRLF, so the proposal was
+    # correctly converted to match it, which is the behaviour tested in test_agent.
+    assert result.proposed.replace("\r\n", "\n").strip() == SIDEWAYS_FIX.strip()
+    assert result.deltas != {c: 0 for c in result.deltas}
 
 
 def test_a_model_that_proposes_nothing_touches_no_files(tmp_path: Path) -> None:
@@ -134,3 +140,66 @@ def test_the_session_measures_the_whole_target_not_just_the_file(tmp_path: Path)
     result = run_session(str(tmp_path), str(p))
 
     assert result.before.total >= 2      # both files counted, not just a.py
+
+def test_a_rejected_attempt_is_retried_with_feedback(tmp_path: Path) -> None:
+    """The whole point: the model is 80% right and misses one consistent thing.
+    Discarding the attempt throws away the only information that would fix it."""
+    p = tmp_path / "a.py"
+    _write(p, UNTYPED)
+    prompts: list[str] = []
+
+    def completer(prompt: str) -> str:
+        prompts.append(prompt)
+        return SIDEWAYS_FIX if len(prompts) == 1 else GOOD_FIX
+
+    model.set_completer(completer)
+
+    result = run_session(str(tmp_path), str(p))
+
+    assert result.kept is True
+    assert result.attempts == 2
+    assert len(result.history) == 1                 # one rejection, recorded
+    assert "REJECTED" in prompts[1]                 # attempt 2 was told it failed
+    assert "nope" in prompts[1]                     # and told the specific error
+
+
+def test_each_attempt_starts_from_the_original_file(tmp_path: Path) -> None:
+    """Attempt 2 must not be asked to patch attempt 1's broken output. Compounding
+    attempts produce errors nobody can attribute, and the feedback would describe
+    a file that no longer exists."""
+    p = tmp_path / "a.py"
+    _write(p, UNTYPED)
+    prompts: list[str] = []
+
+    def completer(prompt: str) -> str:
+        prompts.append(prompt)
+        return SIDEWAYS_FIX if len(prompts) == 1 else GOOD_FIX
+
+    model.set_completer(completer)
+
+    run_session(str(tmp_path), str(p))
+
+    file_section = prompts[1].split("--- BEGIN")[1]
+    assert "return x" in file_section               # the original
+    assert "return nope" not in file_section        # not attempt 1's output
+
+
+def test_repeated_failure_exhausts_and_escalates(tmp_path: Path) -> None:
+    """An unbounded repair loop is an unbounded bill. Exhaustion is an escalation
+    with a record of what was tried, not a silent give-up."""
+    p = tmp_path / "a.py"
+    _write(p, UNTYPED)
+    before = p.read_bytes()
+
+    def completer(prompt: str) -> str:
+        return SIDEWAYS_FIX
+
+    model.set_completer(completer)
+
+    result = run_session(str(tmp_path), str(p), max_attempts=2)
+
+    assert result.kept is False
+    assert result.attempts == 2
+    assert "exhausted" in result.reason
+    assert len(result.history) == 2                 # every rejection kept
+    assert p.read_bytes() == before                 # and the file is untouched

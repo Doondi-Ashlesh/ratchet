@@ -97,7 +97,7 @@ def test_an_annotation_session_that_introduced_a_defect_is_rejected() -> None:
     v = judge(_m(annotation=10), _m(annotation=5, defect=1), Category.ANNOTATION)
 
     assert not v.accepted
-    assert "defect" in v.reason
+    assert "defect +1" in v.reason
 
 
 def test_an_annotation_session_that_moved_errors_sideways_is_rejected() -> None:
@@ -105,7 +105,30 @@ def test_an_annotation_session_that_moved_errors_sideways_is_rejected() -> None:
     v = judge(_m(annotation=10), _m(annotation=7, unknown=3), Category.ANNOTATION)
 
     assert not v.accepted
-    assert "the total did not" in v.reason
+    assert "unknown +3" in v.reason
+
+
+def test_a_net_improvement_that_creates_unknowns_is_still_rejected() -> None:
+    """Observed live, and the reason this rule is per-category rather than net.
+
+    The model annotated a function with three type names it never imported.
+    annotation -4, unknown +3, total 100 -> 99. The old total-must-fall rule
+    accepted it on a margin of one. An unknown is an error nobody has classified,
+    and keeping work that creates them accumulates unexamined problems.
+    """
+    v = judge(_m(annotation=84), _m(annotation=80, unknown=3), Category.ANNOTATION)
+
+    assert not v.accepted
+    assert "unknown +3" in v.reason
+
+
+def test_the_reason_names_every_category_that_grew() -> None:
+    """The next session's prompt needs to be told what it did wrong, specifically."""
+    v = judge(_m(annotation=10), _m(annotation=6, defect=1, unknown=2), Category.ANNOTATION)
+
+    assert not v.accepted
+    assert "defect +1" in v.reason
+    assert "unknown +2" in v.reason
 
 
 def test_real_progress_is_accepted() -> None:

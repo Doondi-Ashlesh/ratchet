@@ -212,4 +212,124 @@ subprocess.
 **class fix** — `[sys.executable, "-m", "mypy", ...]`, which resolves to the
 running interpreter's own environment regardless of PATH. Known limitation: this
 pins mypy to *Ratchet's* environment, so checking a repo with its own venv and
-its own stubs will need that repo's interpreter instead. Not a problem yet.
+its own stubs will need that repo's interpreter instead. Already visible:
+installing `openai` into Ratchet dropped SdkAgent's measured `config` from 13 to
+11 without a line of SdkAgent changing. The measured baseline is not yet a
+property of the target alone.
+
+---
+
+## 013 · The gate accepted hallucinated annotations on a one-error margin
+
+**observed** — First accepted live session. The model annotated `build_graph`
+with `'BaseCheckpointSaver'` and `'CompiledGraph'`, and `make_checkpointer` with
+`'MemorySaver'` — three type names it never imported. Quoted forward references,
+so Python never evaluates them and the code still runs; only mypy sees it.
+
+annotation −4, unknown +3, total 100 → 99. **Accepted.**
+
+**root cause** — `judge()` blocked on `defect` rising but not `unknown`, and
+otherwise judged the **total**. Judging a net lets a session trade errors between
+categories, and a margin of one out of a hundred was enough to keep three
+hallucinated annotations.
+
+**class fix** — Per-category, not net: on a non-CONFIG session the worked category
+must fall and **no** category may rise. That subsumes the total check — if the
+worked category fell and nothing rose, the total fell — so it is one rule where
+there were two, and stricter. The reason string now names the offending category
+(`regressed: unknown +3`) because the next attempt has to be told what it did.
+
+Accepted cost: this rejects correct work that surfaces pre-existing problems,
+since annotating a function makes its call sites checkable. Rejection discards
+and escalates rather than condemns, and a fix that surfaces three latent bugs
+should stop the line. Rate unknown — two data points, and in this case the three
+"reveals" were hallucinations. Log rejections and revisit after ~20 sessions.
+
+**Worth recording:** the harness caught none of this. A human read the deltas and
+noticed `unknown +3` next to `total −1`. The next version catches it mechanically,
+which is the entire argument for running the thing live before trusting it.
+
+---
+
+## 014 · Three live runs, three failure modes, one root cause
+
+**observed** — Same file, same prompt, temperature 0, three runs:
+  1. quoted `'BaseCheckpointSaver'` / `'CompiledGraph'` / `'MemorySaver'` — real
+     LangGraph types, never imported. unknown +3.
+  2. an unresolvable import. config +1.
+  3. `"Optional[Any]"` / `"Any"` with no `typing` import. unknown +6, and it used
+     `Any` everywhere despite the prompt forbidding it.
+
+Every run got `annotation: -4` right.
+
+**root cause** — The model writes annotations referencing names not in scope. The
+file's imports are in the prompt; it does not reason about them. Temperature 0
+narrows the distribution, it does not collapse it — three distinct outputs.
+
+**class fix** — Two, and only the second is enforcement:
+  - prompt: state that any type used must already be imported or the import must
+    be added. Cheap, and it is still only a request.
+  - harness: feed the rejection reason back and retry, bounded. The model is 80%
+    correct and misses one consistent thing; discarding that and starting fresh
+    throws away the only information that would fix it.
+
+Also: this was only diagnosable because SessionResult now keeps the rejected
+proposal. Two runs earlier the evidence was discarded and neither of us could say
+what the model had written.
+
+
+## 015 · The gate is blind to everything the error count cannot see
+
+**observed** — A rejected proposal for `graph.py` had deleted the six-line module
+docstring. The prompt forbids it explicitly. Deleting a docstring produces zero
+mypy errors, so had the annotations been correct the gate would have accepted it
+and the documentation would have been silently lost.
+
+Same run also showed feedback working at the instruction level: the model added
+`from typing import Optional, List` and tried to import `CompiledGraph` from
+`langgraph.graph`. That name does not exist there. The remaining failure is an
+information problem — the model cannot see the library — not an instruction one.
+
+**root cause** — The gate judges one metric. An agent optimising one number is
+indifferent to everything the number does not cover: docstrings, comments,
+deleted functions, rewritten logic that still type-checks.
+
+**class fix** — A structural guard before the gate, working on the AST rather
+than on counts: file parses, top-level definitions preserved, docstrings
+preserved, no new `# type: ignore`, no vacuous annotations. It can also give
+better feedback than the gate can — "you removed the docstring on build_graph"
+is actionable in a way "regressed: unknown +2" is not.
+
+
+## 016 · Retry with feedback converges — when the task is tractable
+
+**observed** — `output_rails.py`: rejected twice ("no progress", then annotation
+84 → 85, actively worse), accepted on attempt 3. The result was correct and
+precise: `_PII: dict[str, re.Pattern[str]]`, and an accurate Union for a mixed
+return dict. Nothing vacuous, nothing hallucinated, nothing else touched.
+
+**root cause of the earlier failures** — Not the loop. `graph.py` requires
+LangGraph's own type names, which the model cannot inspect and was guessing at.
+An information gap, not an instruction gap.
+
+**class fix** — None needed; this is the loop working. Recorded because the
+retry's cost is only justified if it converges, and now there is evidence it
+does: 2 rejections, 1 accept, on a file whose answer was derivable from itself.
+
+---
+
+## 017 · The harness cannot tell a tractable file from an impossible one
+
+**observed** — `graph.py` consumed ~12 API calls and ~20 mypy runs across four
+sessions, failing every time for the same underlying reason.
+`output_rails.py` succeeded in 3 attempts. Nothing in the harness distinguished
+them, and nothing stopped it retrying the first indefinitely.
+
+**root cause** — A session has no memory. Every run starts from zero and rebuilds
+the same failure.
+
+**class fix** — The multi-session loop needs a durable record per file: attempts,
+verdicts, reasons. A file that has failed N times for the same reason gets
+escalated rather than re-dispatched. This is the structured handoff artifact from
+Anthropic's harness work, arriving here as a requirement derived from measurement
+rather than from reading about it.

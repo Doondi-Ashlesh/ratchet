@@ -31,6 +31,17 @@ Completer = Callable[[str], str]
 _injected: Completer | None = None
 
 
+class Truncated(RuntimeError):
+    """The response hit the output limit and was cut off mid-generation.
+
+    Distinct from a bad answer, and worth its own type. A half-file is not a
+    proposal. Observed live: a truncated response arrived as "unterminated string
+    literal at line 51", which reads as the model writing broken Python when it
+    had actually been cut off. Silently returning the fragment turns a budget
+    constraint into an apparent competence problem.
+    """
+
+
 def set_completer(fn: Completer | None) -> None:
     """Inject a fake completer, or pass None to restore live calls."""
     global _injected
@@ -62,13 +73,28 @@ def complete(prompt: str) -> str:
 
     Parsing belongs to the caller: the agent knows it asked for a Python file,
     so it knows how to read the answer. This layer only moves strings.
+
+    Raises Truncated if the response was cut off. That is the one piece of the
+    response this layer does interpret, because the caller cannot tell a complete
+    answer from half of one by looking at the text.
     """
     if _injected is not None:
         return _injected(prompt)
 
-    resp = _client().chat.completions.create(
-        model=model_id(),
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
+    choice = (
+        _client()
+        .chat.completions.create(
+            model=model_id(),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        .choices[0]
     )
-    return str(resp.choices[0].message.content or "")
+
+    if choice.finish_reason == "length":
+        raise Truncated(
+            f"{model_id()} hit its output limit; the file is likely too large to "
+            f"return whole"
+        )
+
+    return str(choice.message.content or "")
