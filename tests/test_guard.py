@@ -110,7 +110,25 @@ def test_a_vacuous_annotation_is_caught() -> None:
     result = check(ORIGINAL, proposed)
 
     assert not result.ok
-    assert "`Any` or `object`" in result.reason
+    assert "says nothing about the value" in result.reason
+
+
+def test_a_parameterised_generic_containing_Any_is_not_vacuous() -> None:
+    """Observed live: this rule fired eleven times on one file, every one of them
+    a false positive on `dict[str, Any]`. A JSON payload genuinely is a mapping of
+    str to anything, and there is no more specific type short of a TypedDict.
+
+    A rail that cries wolf is a rail people learn to route around, which is the
+    exact failure this guard exists to prevent, turned on itself.
+    """
+    for annotation in (
+        "def keep_me(x: int) -> dict[str, Any]:",
+        "def keep_me(x: list[Any]) -> int:",
+        "def keep_me(x: int) -> Mapping[str, object]:",
+    ):
+        proposed = ORIGINAL.replace("def keep_me(x: int) -> int:", annotation)
+
+        assert check(ORIGINAL, proposed).ok, f"false positive on: {annotation}"
 
 
 # ── failure modes of the guard itself ────────────────────────────────────────

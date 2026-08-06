@@ -333,3 +333,47 @@ verdicts, reasons. A file that has failed N times for the same reason gets
 escalated rather than re-dispatched. This is the structured handoff artifact from
 Anthropic's harness work, arriving here as a requirement derived from measurement
 rather than from reading about it.
+
+---
+
+## 018 · Every model call failed with a bare "Connection error"
+
+**observed** — Live runs that had worked for days started failing with
+`openai.APIConnectionError: Connection error.` and nothing else. Isolating it
+outside the harness showed a plain client failing and a client verifying against
+the OS certificate store succeeding immediately, listing 102 models.
+
+**root cause** — The network began inspecting TLS. The proxy's root certificate
+is installed in the Windows certificate store and absent from certifi's bundle,
+which is what the openai client uses by default. Every call therefore failed
+certificate verification, and the error names none of that.
+
+**class fix** — Verify against the OS store via `truststore`. SdkAgent already had
+this fix and Ratchet never got it, which is the real lesson: a fix applied to one
+project is not a fix, it is a note. The error message remains the weak point —
+"Connection error" for a certificate failure is the same class of unhelpful as
+"404 page not found" for a wrong model id.
+
+---
+
+## 019 · One timeout ended a run and discarded the sessions that had succeeded
+
+**observed** — With TLS fixed, the loop reached `gateway/app.py` — the largest
+file, dispatched first because the queue is ordered worst-first — and the request
+timed out at 120s. `APITimeoutError` propagated out of the session, out of the
+graph node, and killed the entire run.
+
+**root cause** — Two independent gaps. The model plane had no retry, so a normal
+event at this call volume was fatal. And whole-file rewriting scales with file
+size: the model must return every line it did not change, so the largest files are
+both the slowest and the most likely to truncate.
+
+**class fix** — Retry transient failures (429, 5xx, timeouts, connection errors)
+with jittered backoff; fail fast on anything the caller caused. Raise the default
+timeout to 300s. Truncation is explicitly *not* retried — a cut-off response is a
+budget problem and the retry reproduces the cut.
+
+Unfixed and now measurable: worst-first ordering sends the hardest file first,
+which maximises count reduction and minimises the chance the first session
+succeeds. Whether that is the right trade needs the accept-rate-by-file-size
+number, not an opinion.

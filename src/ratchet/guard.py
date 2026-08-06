@@ -28,7 +28,22 @@ from dataclasses import dataclass
 # obvious one and the prompt forbids it; `object` is what the model reached for
 # instead, which is the same evasion in different clothing (and worse, since dict
 # is invariant, so dict[object, object] rejects the very value it wraps).
-_VACUOUS = re.compile(r"\b(?:Any|object)\b")
+_VACUOUS = re.compile(r"(?::|->)\s*(Any|object)\s*(?:[=:,)]|$)")
+
+
+def _bare_vacuous(line: str) -> list[str]:
+    """Find `Any` or `object` used as a WHOLE annotation.
+
+    `dict[str, Any]` is not vacuous. A JSON payload genuinely is a mapping of str
+    to anything, and there is no more specific type short of a TypedDict. Flagging
+    it was a false positive that fired eleven times on one file, and a rail that
+    cries wolf is a rail people learn to route around — the exact failure this
+    guard exists to prevent, turned on itself.
+
+    What is vacuous is `x: Any` or `-> object`: the annotation slot filled with a
+    word that excludes nothing.
+    """
+    return [m.group(1) for m in _VACUOUS.finditer(line)]
 
 _TYPE_IGNORE = re.compile(r"#\s*type:\s*ignore")
 
@@ -125,10 +140,10 @@ def check(original: str, proposed: str) -> GuardResult:
             violations.append(f"you added a `# type: ignore`, which is never allowed: {line.strip()}")
 
     for line in added:
-        if _VACUOUS.search(line) and ":" in line:
+        for bare in _bare_vacuous(line):
             violations.append(
-                f"you used `Any` or `object` as an annotation, which satisfies the "
-                f"checker without saying anything: {line.strip()}"
+                f"`{bare}` on its own says nothing about the value; annotate what it "
+                f"actually holds: {line.strip()}"
             )
 
     return GuardResult(not violations, tuple(violations))
