@@ -108,6 +108,7 @@ def _run(args: argparse.Namespace) -> int:
                 max_files=args.max_files,
                 max_attempts=args.max_attempts,
                 max_failures=args.max_failures,
+                order=args.order,
                 thread_id=args.thread,
                 checkpointer=saver,
             )
@@ -117,6 +118,7 @@ def _run(args: argparse.Namespace) -> int:
             max_files=args.max_files,
             max_attempts=args.max_attempts,
             max_failures=args.max_failures,
+            order=args.order,
             thread_id=args.thread,
         )
 
@@ -173,6 +175,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--max-attempts", type=int, default=3)
     run.add_argument("--max-failures", type=int, default=2,
                      help="skip a file after this many failed runs (from committed history)")
+    run.add_argument("--order", choices=["worst", "smallest"], default="worst",
+                     help="worst = most errors first (moves the count fastest); "
+                          "smallest = fewest first (likelier to succeed)")
     run.add_argument("--thread", default="default", help="checkpoint thread id, for resuming")
     run.add_argument("--checkpoint", default="", help="sqlite path; omit for in-memory")
     run.add_argument("--json", action="store_true", help="machine-readable output")

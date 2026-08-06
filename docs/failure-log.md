@@ -377,3 +377,30 @@ Unfixed and now measurable: worst-first ordering sends the hardest file first,
 which maximises count reduction and minimises the chance the first session
 succeeds. Whether that is the right trade needs the accept-rate-by-file-size
 number, not an opinion.
+
+---
+
+## 020 · An accepted change quietly deleted a blank line
+
+**observed** — First successful multi-file run: 4 files, 4 accepted, errors
+96 → 92. The diff on `nodes/plan.py` shows the annotation added *and* a blank
+line removed, leaving one blank line before a top-level `def` where PEP 8 wants
+two. mypy does not care, so the gate accepted it.
+
+**root cause** — Same shape as failure-log 015, which produced the guard: the
+gate measures one metric and is blind to everything the metric does not cover.
+The guard was then taught about docstrings, `type: ignore`, and vacuous
+annotations — a list of the damage seen so far, which does not generalise.
+Formatting was simply the next thing nobody had thought of.
+
+**class fix** — Stop enumerating style rules in the guard. The target repo
+already declares its own: a `ruff`/`black`/`flake8` config is a machine-readable
+statement of what counts as damage there. Run the repo's own linter as a second
+oracle and reject a proposal that makes it worse, exactly as the gate does with
+mypy. The guard keeps only the checks no linter can express — deleted docstrings,
+removed definitions, suppressions.
+
+Also observed: with the vacuous rule narrowed to bare `Any`/`object`, the model
+moved to `dict[str, object]`. That is a legitimate annotation for a genuinely
+heterogeneous mapping, so allowing it is correct — but the drift is worth
+watching. Each time a rule tightens, the next proposal lands just inside it.

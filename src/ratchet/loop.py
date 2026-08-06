@@ -55,6 +55,7 @@ class LoopState(TypedDict, total=False):
     max_attempts: int
     max_files: int
     max_failures: int
+    order: str
 
     queue: Annotated[list[str], _keep_last]
     results: Annotated[list[dict[str, Any]], _extend]
@@ -101,9 +102,17 @@ def preflight(state: LoopState) -> LoopState:
     hist = history.load(target)
     max_failures = state.get("max_failures", MAX_FAILURES_BEFORE_SKIP)
 
+    # Worst-first moves the count fastest; smallest-first is likelier to succeed.
+    # Whole-file rewriting scales with file size, so the biggest file is both the
+    # slowest and the most likely to time out or truncate (failure-log 019) — and
+    # worst-first dispatches it first. Neither order is right in the abstract; the
+    # answer needs accept-rate-by-file-size, which is what `ratchet bench` measures.
+    reverse = state.get("order", "worst") == "worst"
+    ordered = sorted(by_file.items(), key=lambda kv: kv[1], reverse=reverse)
+
     queue: list[str] = []
     skipped: list[dict[str, str]] = []
-    for path, _n in sorted(by_file.items(), key=lambda kv: -kv[1]):
+    for path, _n in ordered:
         why = hist.blocked(_rel(target, path), max_failures)
         if why:
             skipped.append({"file": _rel(target, path), "reason": why})
@@ -216,6 +225,7 @@ def run_loop(
     max_files: int = 0,
     max_attempts: int = 3,
     max_failures: int = MAX_FAILURES_BEFORE_SKIP,
+    order: str = "worst",
     thread_id: str = "default",
     checkpointer: Any = None,
 ) -> LoopState:
@@ -227,6 +237,7 @@ def run_loop(
         "max_files": max_files,
         "max_attempts": max_attempts,
         "max_failures": max_failures,
+        "order": order,
         "queue": [],
         "results": [],
         "skipped": [],
