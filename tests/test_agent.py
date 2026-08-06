@@ -188,3 +188,23 @@ def test_identical_content_in_different_endings_is_not_a_change(tmp_path: Path) 
     model.set_completer(lambda _: "def f(x):\n    return x\n")
 
     assert propose(str(p), [_diag()]).changed is False
+
+
+def test_a_truncated_response_is_reported_as_such(tmp_path: Path) -> None:
+    """A half-file is not a proposal. Observed live as "unterminated string
+    literal at line 51", which reads as the model writing broken Python when it
+    had actually been cut off. Naming the real constraint stops the loop spending
+    its remaining attempts on syntax errors that were never the model's fault."""
+    p = tmp_path / "a.py"
+    _write(p, CODE)
+
+    def cut_off(_: str) -> str:
+        raise model.Truncated("hit its output limit")
+
+    model.set_completer(cut_off)
+
+    out = propose(str(p), [_diag()])
+
+    assert out.changed is False
+    assert "truncated" in out.note
+    assert p.read_bytes() == CODE.encode()      # nothing was written

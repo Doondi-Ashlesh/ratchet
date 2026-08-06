@@ -13,13 +13,20 @@ measured as a regression.
 So the verdict depends on what the session was working on:
 
   CONFIG      config must fall. The total may rise; those are reveals.
-  everything  the total must fall AND defect must not rise.
+  everything  the worked category must fall and NO category may rise.
   else
 
-The defect rule is deliberately conservative. A newly revealed defect was not
-caused by the agent — but it is still something a human must look at, so the
-session is held rather than waved through. Blocking on a problem the agent did
-not create is the correct trade when the alternative is blessing it.
+The per-category rule is deliberately conservative, and it replaced a
+total-must-fall rule that let a real failure through. Observed live: the model
+annotated a function with three type names it never imported, four annotation
+errors went away, three unclassifiable ones appeared, and a net of minus one was
+enough to keep it. Judging the total lets a session trade errors between
+categories; judging each category does not.
+
+It will also reject correct work that surfaces pre-existing problems, because
+annotating a function makes its call sites checkable and those may hold real
+errors. That is the intended trade: rejection discards and escalates rather than
+condemns, and a fix that surfaces three latent bugs should stop the line.
 """
 from __future__ import annotations
 
@@ -84,21 +91,18 @@ def judge(before: Measurement, after: Measurement, worked_on: Category) -> Verdi
             deltas,
         )
 
-    if deltas[Category.DEFECT.value] > 0:
-        return Verdict(
-            False,
-            f"introduced or revealed {deltas[Category.DEFECT.value]} defect(s); "
-            "a human decides before this is kept",
-            deltas,
-        )
-
-    if after.total >= before.total:
-        return Verdict(
-            False,
-            f"{worked_on.value} fell but the total did not: "
-            f"{before.total} -> {after.total}",
-            deltas,
-        )
+    # A source edit cannot reveal anything mypy was previously blind to, the way a
+    # config fix can, so no category may grow. This subsumes a total check: if the
+    # worked category fell and nothing else rose, the total fell by construction.
+    #
+    # It does reject correct work that surfaces pre-existing problems — annotating
+    # a function makes its call sites checkable, and those may hold real errors.
+    # That is the intended trade: rejection discards and escalates, it does not
+    # condemn, and a fix that surfaces three latent bugs should stop the line.
+    grew = [(c.value, deltas[c.value]) for c in Category if deltas[c.value] > 0]
+    if grew:
+        detail = ", ".join(f"{name} +{n}" for name, n in grew)
+        return Verdict(False, f"regressed: {detail}", deltas)
 
     return Verdict(
         True,

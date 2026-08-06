@@ -31,6 +31,8 @@ Rules:
 - Do NOT use `Any` unless there is genuinely no more specific type.
 - Do NOT change what the code does at runtime.
 - Do NOT delete or rewrite code, comments, or docstrings.
+- Every type you use must ALREADY be imported in this file, or you must add the
+  import. Do not reference a name that is not in scope.
 - Return the COMPLETE file, unchanged except for the annotations.
 - Return only the file. No explanation, no markdown fences.
 """
@@ -88,7 +90,7 @@ def _normalize(text: str, like: str) -> str:
     return body
 
 
-def propose(path: str, diagnostics: Sequence[Classified]) -> Proposal:
+def propose(path: str, diagnostics: Sequence[Classified], feedback: str = "") -> Proposal:
     """Ask the model for a corrected version of `path`.
 
     Raises if handed anything but ANNOTATION work. That is a programming error in
@@ -107,10 +109,19 @@ def propose(path: str, diagnostics: Sequence[Classified]) -> Proposal:
     prompt = (
         f"{_RULES}\n"
         f"Errors to fix:\n{_format(diagnostics)}\n\n"
+        f"{feedback}"
         f"--- BEGIN {path} ---\n{original}\n--- END {path} ---\n"
     )
 
-    proposed = _normalize(_unfence(model.complete(prompt)), like=original)
+    try:
+        raw = model.complete(prompt)
+    except model.Truncated as e:
+        # An outcome, not a crash. Surfacing it as a note names the real constraint
+        # — this file may be too large to rewrite whole — instead of spending the
+        # remaining attempts on syntax errors that were never the model's fault.
+        return Proposal(path, original, "", changed=False, note=f"truncated: {e}")
+
+    proposed = _normalize(_unfence(raw), like=original)
     if not proposed.strip():
         return Proposal(path, original, "", changed=False, note="model returned nothing")
 
