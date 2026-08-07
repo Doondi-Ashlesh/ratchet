@@ -6,8 +6,24 @@ requires-python=">=3.11"
 dependencies=[]
 
 [project.optional-dependencies]
-agent = ["openai>=1.40"]
-dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "pre-commit>=3", "openai>=1.40"]
+agent = [
+  "openai>=1.40",
+  "langgraph>=1.0",
+  "langgraph-checkpoint-sqlite>=2.0",
+  "langsmith>=0.1",
+  "truststore>=0.9",
+]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "pre-commit>=3",
+  "openai>=1.40",
+  "langgraph>=1.0",
+  "langgraph-checkpoint-sqlite>=2.0",
+  "langsmith>=0.1",
+  "truststore>=0.9",
+]
 
 [project.scripts]
 ratchet = "ratchet.cli:main"

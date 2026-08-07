@@ -104,3 +104,19 @@ def test_check_requires_a_path(capsys: pytest.CaptureFixture[str]) -> None:
 def test_an_unknown_subcommand_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit):
         main(["frobnicate"])
+
+
+def test_every_run_flag_reaches_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--deadline was first wired into the checkpointed branch only, so the flag
+    silently did nothing without --checkpoint. This pins that every flag the
+    parser accepts is actually forwarded, on the path people use by default."""
+    from ratchet import loop
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(loop, "run_loop", lambda path, **kw: seen.update(kw, path=path) or {})
+
+    main(["run", "pkg", "--deadline", "12", "--max-files", "3", "--order", "smallest"])
+
+    assert seen["deadline_s"] == 12.0
+    assert seen["max_files"] == 3
+    assert seen["order"] == "smallest"

@@ -333,3 +333,152 @@ verdicts, reasons. A file that has failed N times for the same reason gets
 escalated rather than re-dispatched. This is the structured handoff artifact from
 Anthropic's harness work, arriving here as a requirement derived from measurement
 rather than from reading about it.
+
+---
+
+## 018 · Every model call failed with a bare "Connection error"
+
+**observed** — Live runs that had worked for days started failing with
+`openai.APIConnectionError: Connection error.` and nothing else. Isolating it
+outside the harness showed a plain client failing and a client verifying against
+the OS certificate store succeeding immediately, listing 102 models.
+
+**root cause** — The network began inspecting TLS. The proxy's root certificate
+is installed in the Windows certificate store and absent from certifi's bundle,
+which is what the openai client uses by default. Every call therefore failed
+certificate verification, and the error names none of that.
+
+**class fix** — Verify against the OS store via `truststore`. SdkAgent already had
+this fix and Ratchet never got it, which is the real lesson: a fix applied to one
+project is not a fix, it is a note. The error message remains the weak point —
+"Connection error" for a certificate failure is the same class of unhelpful as
+"404 page not found" for a wrong model id.
+
+---
+
+## 019 · One timeout ended a run and discarded the sessions that had succeeded
+
+**observed** — With TLS fixed, the loop reached `gateway/app.py` — the largest
+file, dispatched first because the queue is ordered worst-first — and the request
+timed out at 120s. `APITimeoutError` propagated out of the session, out of the
+graph node, and killed the entire run.
+
+**root cause** — Two independent gaps. The model plane had no retry, so a normal
+event at this call volume was fatal. And whole-file rewriting scales with file
+size: the model must return every line it did not change, so the largest files are
+both the slowest and the most likely to truncate.
+
+**class fix** — Retry transient failures (429, 5xx, timeouts, connection errors)
+with jittered backoff; fail fast on anything the caller caused. Raise the default
+timeout to 300s. Truncation is explicitly *not* retried — a cut-off response is a
+budget problem and the retry reproduces the cut.
+
+Unfixed and now measurable: worst-first ordering sends the hardest file first,
+which maximises count reduction and minimises the chance the first session
+succeeds. Whether that is the right trade needs the accept-rate-by-file-size
+number, not an opinion.
+
+---
+
+## 020 · An accepted change quietly deleted a blank line
+
+**observed** — First successful multi-file run: 4 files, 4 accepted, errors
+96 → 92. The diff on `nodes/plan.py` shows the annotation added *and* a blank
+line removed, leaving one blank line before a top-level `def` where PEP 8 wants
+two. mypy does not care, so the gate accepted it.
+
+**root cause** — Same shape as failure-log 015, which produced the guard: the
+gate measures one metric and is blind to everything the metric does not cover.
+The guard was then taught about docstrings, `type: ignore`, and vacuous
+annotations — a list of the damage seen so far, which does not generalise.
+Formatting was simply the next thing nobody had thought of.
+
+**class fix** — Stop enumerating style rules in the guard. The target repo
+already declares its own: a `ruff`/`black`/`flake8` config is a machine-readable
+statement of what counts as damage there. Run the repo's own linter as a second
+oracle and reject a proposal that makes it worse, exactly as the gate does with
+mypy. The guard keeps only the checks no linter can express — deleted docstrings,
+removed definitions, suppressions.
+
+Also observed: with the vacuous rule narrowed to bare `Any`/`object`, the model
+moved to `dict[str, object]`. That is a legitimate annotation for a genuinely
+heterogeneous mapping, so allowing it is correct — but the drift is worth
+watching. Each time a rule tightens, the next proposal lands just inside it.
+
+---
+
+## 021 · The TLS fix was written per-client, so it only fixed one client
+
+**observed** — With `LANGSMITH_TRACING=true` and a key set, every trace upload
+failed: `CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate`.
+The run itself worked. The model calls went through and the traces did not.
+
+**root cause** — Failure-log 018 diagnosed this correctly (a network that
+inspects TLS, root in the OS store, absent from certifi) and then fixed it in the
+wrong place: an `httpx` context handed to the OpenAI client. LangSmith's uploader
+is a different client — `requests`/`urllib3`, its own certifi bundle — so it was
+never covered. The fix was scoped to the symptom that was visible at the time.
+
+**class fix** — `truststore.inject_into_ssl()` once at the CLI entry point,
+which patches the `ssl` module process-wide and therefore covers every client,
+including ones not imported yet. Not done on module import: a library has no
+business monkey-patching global `ssl`, an application does.
+
+The general lesson is about the shape of the first fix, not about TLS. "Configure
+this client correctly" scales with the number of clients. "Configure the layer
+they all sit on" does not.
+
+---
+
+## 022 · Tracing was wired, enabled, and reported zero tokens
+
+**observed** — First traces to arrive in LangSmith showed every model span as
+`tokens in/out = 0/0`. The spans existed, were named correctly, and carried no
+usage data at all — so the one question worth asking a trace ("what did this
+run cost, and where") was unanswerable.
+
+**root cause** — `@traceable(run_type="llm")` on a function returning `str`.
+The decorator records what the function returns; the function had already thrown
+the response object away and kept `choices[0].message.content`. Declaring
+`run_type="llm"` makes LangSmith *render* a span as a model call. It does not
+make usage data appear.
+
+A second defect in the same area: every graph node also carried `@traceable`,
+while LangGraph opens a span per node on its own. Every node was therefore
+recorded twice, with identical start times and durations.
+
+**class fix** — Stop hand-instrumenting what the library instruments. The client
+is wrapped with `langsmith.wrappers.wrap_openai`, so usage is read by the code
+that owns the response shape, and the node decorators are gone. Result on the
+next run: `in/out = 3540/6146`, `ls_model_name`, `ls_temperature`, and the
+`langgraph_node` that spent it, all without Ratchet parsing anything.
+
+Wrapping is guarded by a deliberately blind `except`. Instrumentation must never
+be able to break the call it instruments: traces are diagnostic, the completion
+is the product.
+
+---
+
+## 023 · A run that cannot finish is indistinguishable from a run that hung
+
+**observed** — Two consecutive unattended runs were killed by an outer `timeout`
+after nine minutes with no output at all. Both had done real work — the state
+file showed accepted sessions — but nothing was reported, because the summary
+only prints at the end.
+
+**root cause** — The traces answered it in one line: a single completion took
+**530 seconds** and produced **10,048 output tokens** — for a 197-line file. The
+cost was reasoning tokens, not input size. This matters because the obvious fix,
+a file-size cap, would not have caught it: that file was the second smallest in
+the package. Per-call wall-clock is not predictable from anything visible before
+the call.
+
+**class fix** — Bound the run, not the file. `--deadline` stops dispatching new
+files once the budget is spent and reports what was already earned, with the
+remainder recorded as `run deadline reached`. Checked between sessions, never
+inside one, because a session is the smallest unit the gate can keep or revert;
+interrupting mid-session abandons a proposal nobody has judged.
+
+This is the first fix in this log that was found by reading a trace rather than
+by reading a diff. Three runs were spent guessing at model timeouts before
+tracing worked; the answer took one query afterwards.
