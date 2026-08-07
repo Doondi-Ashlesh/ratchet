@@ -21,6 +21,7 @@ import json
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+from typing import Any
 
 from ratchet.bench import DirtyTree, NotAGitRepo, Trial, format_report, run_bench
 from ratchet.classify import Category, from_result, summary
@@ -101,26 +102,23 @@ def _run(args: argparse.Namespace) -> int:
     working for anyone who installed without the agent extras."""
     from ratchet import loop
 
+    # Built once rather than repeated per branch: --deadline was first wired into
+    # only the checkpointed call, so the flag silently did nothing without
+    # --checkpoint. Two argument lists that must stay identical will not.
+    opts: dict[str, Any] = {
+        "max_files": args.max_files,
+        "max_attempts": args.max_attempts,
+        "max_failures": args.max_failures,
+        "order": args.order,
+        "deadline_s": args.deadline,
+        "thread_id": args.thread,
+    }
+
     if args.checkpoint:
         with loop.make_checkpointer(args.checkpoint) as saver:
-            state = loop.run_loop(
-                args.path,
-                max_files=args.max_files,
-                max_attempts=args.max_attempts,
-                max_failures=args.max_failures,
-                order=args.order,
-                thread_id=args.thread,
-                checkpointer=saver,
-            )
+            state = loop.run_loop(args.path, checkpointer=saver, **opts)
     else:
-        state = loop.run_loop(
-            args.path,
-            max_files=args.max_files,
-            max_attempts=args.max_attempts,
-            max_failures=args.max_failures,
-            order=args.order,
-            thread_id=args.thread,
-        )
+        state = loop.run_loop(args.path, **opts)
 
     results = list(state.get("results", []))
     skipped = list(state.get("skipped", []))
@@ -152,7 +150,29 @@ def _run(args: argparse.Namespace) -> int:
     return EXIT_OK if kept or not results else EXIT_FOUND
 
 
+def _use_os_certificates() -> None:
+    """Verify TLS against the OS certificate store, process-wide.
+
+    Fixing this per-client was the instance fix and it did not hold: the OpenAI
+    client got a custom httpx context, and then LangSmith's uploader failed the
+    same way because it uses requests/urllib3 with certifi. Every future client
+    would have needed the same patch.
+
+    `inject_into_ssl()` patches the ssl module once, so anything in the process
+    verifying TLS picks up the OS store — including libraries that have not been
+    imported yet. Done here rather than on import because a library has no
+    business monkey-patching global ssl; an application does.
+    """
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except ImportError:
+        pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _use_os_certificates()
     parser = argparse.ArgumentParser(
         prog="ratchet",
         description="A harness for long-running agents, built on a metric that only moves one way.",
@@ -178,6 +198,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--order", choices=["worst", "smallest"], default="worst",
                      help="worst = most errors first (moves the count fastest); "
                           "smallest = fewest first (likelier to succeed)")
+    run.add_argument("--deadline", type=float, default=0.0,
+                     help="seconds; stop dispatching new files past this and report "
+                          "what was done (0 = no bound)")
     run.add_argument("--thread", default="default", help="checkpoint thread id, for resuming")
     run.add_argument("--checkpoint", default="", help="sqlite path; omit for in-memory")
     run.add_argument("--json", action="store_true", help="machine-readable output")

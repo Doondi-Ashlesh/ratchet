@@ -31,6 +31,28 @@ gate       ->  judge          keep it, or revert byte for byte
 
 Every step except `propose` is deterministic. The model proposes; the harness disposes.
 
+That is one session, one file. A codebase needs many, and the loop over them is a LangGraph state machine rather than a `while`:
+
+```
+        ┌───────────────┐
+START ─→│   preflight   │  measure once, build the queue,
+        └───────┬───────┘  drop what history says keeps failing
+                │
+                ▼
+        ┌───────────────┐
+        │     work      │◀─┐  one file, one session
+        └───────┬───────┘  │
+                │──────────┘  queue not empty
+                │
+       ┌────────┴────────┐
+       ▼                 ▼
+  ┌──────────┐         END
+  │ escalate │  nothing succeeded; stop and ask a person
+  └──────────┘
+```
+
+A `while` loop would run these sessions. It would not survive being killed, would not resume where it stopped, and would have no pause point a human could approve at. Those three are framework features here — checkpointing, resumption, and `interrupt_before` — rather than machinery to build and then prove correct.
+
 ### Triage
 
 Not every error is work an agent should attempt. Errors are routed by what it would actually take to fix them:
@@ -109,7 +131,60 @@ That third one matters. A pipeline has to tell "mypy is not installed" apart fro
 
 `--json` gives the same result machine-readable.
 
+### Work through a codebase
+
+```bash
+ratchet run path/to/package --max-files 3 --deadline 240
+```
+
+```
+ratchet run src/sdk_agent
+
+  kept      nodes/verify.py       1x  annotation 78 -> 76; total 91 -> 89
+  reverted  catalog/catalog.py    1x  exhausted 1 attempts; escalating. Last: guard: you removed t
+  skipped   graph.py                  run deadline reached
+
+  errors  91 -> 89
+  kept    1/2 session(s)
+```
+
+| Flag | Why it exists |
+|---|---|
+| `--max-files` | bound the blast radius of an unattended run |
+| `--max-attempts` | per-file retry budget |
+| `--max-failures` | stop dispatching a file that has failed this often *across runs* |
+| `--order` | `worst` moves the count fastest, `smallest` is likelier to succeed |
+| `--deadline` | seconds; stop dispatching past this and report what was earned |
+| `--checkpoint` | SQLite path, so a killed run resumes instead of restarting |
+| `--thread` | which run to resume |
+
+`--deadline` is the one that is not obvious. Per-call wall-clock is not predictable from anything you can see beforehand: the slowest session measured took 530 seconds on the *second smallest* file in the package, because the cost was 10k output tokens of reasoning rather than input size. A file-size cap would not have caught it. Bounding the run does.
+
+### Memory across runs
+
+Every verdict is written to `.ratchet/state.json` **in the target repository**, and it is meant to be committed. A file that has failed twice is not dispatched a third time, and the reason it is being skipped travels with the code, visible in a diff, rather than living in a cache on whoever ran it last.
+
+### Observability
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=...
+export LANGSMITH_PROJECT=ratchet
+```
+
+Traces go to LangSmith. Nodes are not decorated — LangGraph opens a span per node on its own, and decorating them too recorded everything twice. The OpenAI client is wrapped with `langsmith.wrappers.wrap_openai`, so token counts, model id and temperature are read by the code that owns the response shape:
+
+```
+chain  work         success  160.7s
+chain  complete     success  156.3s
+llm    ChatOpenAI   success  154.1s   in/out=1265/10667
+```
+
+Each model span carries the `langgraph_node` that spent it, which is what makes "which file ate the budget" a query rather than a guess. Ratchet parses none of this itself. Instrumentation is wrapped in a deliberately blind `except`: traces are diagnostic, the completion is the product, and observability must never be able to break the thing it observes.
+
 ### Run one session
+
+
 
 ```python
 from ratchet.session import run_session
@@ -136,11 +211,13 @@ Any OpenAI-compatible endpoint works. The provider is a base-URL change.
 
 ## Status
 
-Early. The single-file loop works end to end against a real model and a real codebase.
+Early, but it runs unattended against a real model and a real codebase now.
 
-**Working:** measurement, triage, the gate, one session with bounded retry, the CLI.
+**Working:** measurement, triage, the gate, bounded retry, the multi-file loop, cross-run memory, checkpoint/resume, a wall-clock budget, LangSmith tracing, the CLI.
 
-**Not built yet:** the multi-session loop, resumable state across runs, a separate evaluator, a clean-tree precondition.
+Measured on a 2,300-line target: `errors 96 → 92`, four of four sessions kept, then `91 → 89` on a later bounded run. Every accepted change is a real annotation; every rejected one was reverted byte for byte.
+
+**Not built yet:** a separate evaluator model, a clean-tree precondition on `run`, and the second oracle described in [failure log 020](docs/failure-log.md) — running the target's own linter so the guard stops enumerating style rules it learned one at a time.
 
 The measured baseline is not yet a property of the target alone, because mypy runs in Ratchet's environment. Installing a package into Ratchet changes what it reports about your repo. See [failure log 012](docs/failure-log.md).
 
@@ -159,6 +236,10 @@ The [failure log](docs/failure-log.md) is the most useful document in this repos
 **A prompt is a request.** Told not to use `Any`, the model returned `dict[object, object]` instead. Equally vacuous, and because `dict` is invariant it swapped one error for another.
 
 **Temperature 0 is not determinism.** Same file, same prompt, three runs, three distinct failure modes. All three shared one root cause: annotations referencing names never imported.
+
+**A fix scoped to the symptom does not hold.** TLS verification was fixed by handing one client a custom context. It worked, and then trace uploads failed identically, because that was a different client. "Configure this client" scales with the number of clients; patching the layer underneath them does not.
+
+**Declaring a span an LLM call does not make it one.** `@traceable(run_type="llm")` on a function returning `str` rendered correctly in the UI and reported `tokens 0/0` — the response object had already been discarded. Hand-instrumenting what the library instruments cost the exact number the tracing was added to get.
 
 **The harness caught what a human read past.** Reading a diff, `-> dict[object, object]` and three quoted type names looked entirely reasonable. The checker rejected both in about a second.
 

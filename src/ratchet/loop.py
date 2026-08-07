@@ -21,11 +21,11 @@ many files, and "which file ate the budget" is not answerable from a summary lin
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
-from langsmith import traceable
 
 from ratchet import history
 from ratchet.classify import actionable, from_result
@@ -56,6 +56,8 @@ class LoopState(TypedDict, total=False):
     max_files: int
     max_failures: int
     order: str
+    deadline_s: float
+    started: float
 
     queue: Annotated[list[str], _keep_last]
     results: Annotated[list[dict[str, Any]], _extend]
@@ -81,7 +83,6 @@ def _rel(target: str, path: str) -> str:
     return rel.as_posix()
 
 
-@traceable(name="preflight", run_type="chain")
 def preflight(state: LoopState) -> LoopState:
     """Measure once, decide what is worth dispatching, and refuse the rest.
 
@@ -128,15 +129,44 @@ def preflight(state: LoopState) -> LoopState:
         "skipped": skipped,
         "baseline": dict(baseline.counts),
         "latest": dict(baseline.counts),
+        # Stamped here, not at call time, so a resumed run gets the full budget
+        # again rather than inheriting an already-expired clock from a checkpoint.
+        "started": time.time(),
     }
 
 
-@traceable(name="work", run_type="chain")
+def _expired(state: LoopState) -> bool:
+    budget = float(state.get("deadline_s", 0) or 0)
+    started = float(state.get("started", 0) or 0)
+    return bool(budget and started and time.time() - started >= budget)
+
+
 def work(state: LoopState) -> LoopState:
-    """One file, one session. The graph handles the repetition."""
+    """One file, one session. The graph handles the repetition.
+
+    The budget is checked between files rather than inside one, because a session
+    is the smallest unit that can be kept or reverted. Interrupting mid-session
+    would abandon a proposal that the gate had not yet judged.
+    """
     queue = list(state["queue"])
-    path = queue.pop(0)
     target = state["target"]
+
+    # A session's wall-clock cost is not predictable from the file. The slowest one
+    # measured took 530s for a 197-line file: the cost was 10k output tokens of
+    # reasoning, not the size of the input, so no file-size heuristic would have
+    # caught it. What an unattended run actually needs is a bound on the whole run,
+    # after which it stops dispatching and reports what it did — the alternative is
+    # what happened before this existed, an outer `timeout` killing the process and
+    # discarding every result already earned.
+    if _expired(state):
+        return {
+            "queue": [],
+            "skipped": [
+                {"file": _rel(target, p), "reason": "run deadline reached"} for p in queue
+            ],
+        }
+
+    path = queue.pop(0)
 
     result = run_session(target, path, max_attempts=state.get("max_attempts", 3))
 
@@ -160,7 +190,6 @@ def work(state: LoopState) -> LoopState:
     }
 
 
-@traceable(name="escalate", run_type="chain")
 def escalate(state: LoopState) -> LoopState:
     """Where a run stops and asks for a person.
 
@@ -194,6 +223,12 @@ def build(checkpointer: Any = None, require_approval: bool = False) -> Any:
     every escalation is not a batch run, and a pause point nobody resumes is worse
     than no pause point at all.
     """
+    # The nodes carry no @traceable decorator on purpose. LangGraph already opens a
+    # span per node against whatever tracer is configured, so decorating them too
+    # produced two identical spans for every node — visible in LangSmith as a
+    # duplicated `preflight` with the same start time and duration. Adding a
+    # decorator is the obvious way to "turn on tracing" and the reason it is absent
+    # is not visible from the node definitions, so it is recorded here.
     g: StateGraph[LoopState] = StateGraph(LoopState)
     g.add_node("preflight", preflight)
     g.add_node("work", work)
@@ -226,6 +261,7 @@ def run_loop(
     max_attempts: int = 3,
     max_failures: int = MAX_FAILURES_BEFORE_SKIP,
     order: str = "worst",
+    deadline_s: float = 0.0,
     thread_id: str = "default",
     checkpointer: Any = None,
 ) -> LoopState:
@@ -238,6 +274,7 @@ def run_loop(
         "max_attempts": max_attempts,
         "max_failures": max_failures,
         "order": order,
+        "deadline_s": deadline_s,
         "queue": [],
         "results": [],
         "skipped": [],

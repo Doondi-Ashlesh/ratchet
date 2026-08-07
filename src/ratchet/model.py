@@ -73,13 +73,56 @@ def _base_url() -> str:
     return os.environ.get("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
 
+_cached: tuple[tuple[str, str, float], Any] | None = None
+
+
+def reset_client() -> None:
+    """Drop the cached client. Needed after changing base URL, key or timeout."""
+    global _cached
+    _cached = None
+
+
 def _client() -> Any:
+    """Built once and reused. A fresh client per call opens a new connection pool
+    every time, which on a loop making dozens of calls is both slower and a new
+    chance for the TLS handshake to fail."""
+    global _cached
     key = os.environ.get("NVIDIA_API_KEY")
     if not key:
         raise RuntimeError(
             "No NVIDIA_API_KEY. Set it for live calls, or inject a fake with "
             "model.set_completer(fn) for offline use."
         )
+    signature = (_base_url(), key, _timeout())
+    if _cached is not None and _cached[0] == signature:
+        return _cached[1]
+    client = _wrap(_build(key))
+    _cached = (signature, client)
+    return client
+
+
+def _wrap(client: Any) -> Any:
+    """Let LangSmith instrument the client rather than tracing by hand.
+
+    The hand-rolled span reported `tokens 0/0` in the UI, because a `@traceable`
+    function that returns a plain string gives LangSmith no response object to read
+    usage off. `wrap_openai` reads the actual response, so model id, token counts
+    and cost are attributed by the same code that knows the response shape — and
+    keeps working when that shape changes.
+
+    Instrumentation must never be able to break the call it instruments, so any
+    failure here degrades to an untraced client rather than propagating. Traces are
+    diagnostic; the completion is the product.
+    """
+    try:
+        from langsmith.wrappers import wrap_openai
+
+        return wrap_openai(client)
+    except Exception:  # noqa: BLE001 - deliberately blind; see docstring
+        return client
+
+
+def _build(key: str) -> Any:
     from openai import OpenAI  # lazy: only needed for live calls
 
     # Verify against the OS certificate store rather than certifi's bundle.
@@ -187,15 +230,15 @@ def complete(prompt: str) -> str:
     ) from last
 
 
-@traceable(name="llm", run_type="llm")
+@traceable(name="complete", run_type="chain")
 def _live_call(prompt: str) -> str:
     """The traced boundary. Split out from `complete` so the injected-fake path
     never opens a span — a run whose traces are half real calls and half test
     doubles is worse than no traces.
 
-    run_type="llm" rather than "chain" so LangSmith renders it as a model call and
-    attributes tokens and cost to it. That attribution is the whole reason to trace
-    a loop that makes dozens of calls across many files.
+    A chain span, not an llm one: the wrapped client emits the llm span underneath
+    with real token attribution. This span exists for what the wrapper cannot see —
+    that a retry happened, and that these attempts belong to one logical completion.
     """
     resp = _client().chat.completions.create(
         model=model_id(),

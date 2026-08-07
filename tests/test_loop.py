@@ -174,3 +174,40 @@ def test_history_keys_use_forward_slashes_on_every_platform(tmp_path: Path) -> N
 
     assert keys == ["pkg/a.py"]
     assert not any("\\" in k for k in keys)
+
+
+def test_the_deadline_stops_dispatch_and_keeps_what_was_earned(tmp_path: Path) -> None:
+    """The whole point of the bound: a run that runs out of time reports its
+    results rather than losing them. An outer `timeout` killing the process is
+    what this replaces, and that discarded everything."""
+    _repo(tmp_path, {"a.py": UNTYPED, "b.py": UNTYPED, "c.py": UNTYPED})
+
+    calls = {"n": 0}
+
+    def slow(_: str) -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The first session alone consumes the budget.
+            loop.time.sleep(0.05)
+        return GOOD
+
+    model.set_completer(slow)
+
+    out = loop.run_loop(str(tmp_path), deadline_s=0.01)
+
+    assert len(out["results"]) == 1, "the in-flight session is never abandoned"
+    assert out["results"][0]["kept"]
+    assert [s["reason"] for s in out["skipped"]] == ["run deadline reached"] * 2
+    assert out["queue"] == []
+
+
+def test_no_deadline_means_no_bound(tmp_path: Path) -> None:
+    """Zero is off, not 'expire immediately' — the default must not silently
+    stop a run from doing any work at all."""
+    _repo(tmp_path, {"a.py": UNTYPED, "b.py": UNTYPED})
+    model.set_completer(lambda _: GOOD)
+
+    out = loop.run_loop(str(tmp_path), deadline_s=0.0)
+
+    assert len(out["results"]) == 2
+    assert out["skipped"] == []

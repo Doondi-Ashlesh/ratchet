@@ -156,3 +156,32 @@ def test_usage_counts_what_was_billed_not_what_was_attempted(
 
     assert model.usage()["calls"] == 1          # unusable, but billed
     assert model.usage()["output"] == 5
+
+
+def test_the_client_is_reused_across_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh client per call opens a new connection pool every time. On a run
+    making dozens of calls that is both slower and a new chance for the TLS
+    handshake to fail."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    model.reset_client()
+    built: list[int] = []
+    monkeypatch.setattr(model, "_build", lambda key: built.append(1) or object())
+
+    first, second = model._client(), model._client()
+
+    assert first is second
+    assert len(built) == 1
+
+
+def test_changing_the_endpoint_rebuilds_the_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Caching must not outlive the configuration it was built from, or a base-URL
+    change appears to be ignored."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    model.reset_client()
+    monkeypatch.setattr(model, "_build", lambda key: object())
+
+    first = model._client()
+    monkeypatch.setenv("NIM_BASE_URL", "https://elsewhere.example/v1")
+    second = model._client()
+
+    assert first is not second
