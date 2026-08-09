@@ -18,6 +18,65 @@ Ratchet is that check, plus the machinery around it.
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart TB
+    CLI["<b>CLI</b><br/>check · run · bench"]
+
+    subgraph LOOP["Orchestration · LangGraph state machine"]
+        direction LR
+        PRE["preflight<br/><i>measure, build the queue</i>"]
+        WORK["work<br/><i>one file, one session</i>"]
+        ESC["escalate<br/><i>stop, ask a person</i>"]
+        PRE --> WORK
+        WORK --> ESC
+    end
+
+    subgraph SESS["Session · one file, one unit of work"]
+        direction LR
+        PROP["propose"]
+        APP["apply"]
+        RE["re-measure"]
+        JUD["judge<br/><i>keep, or revert</i>"]
+        PROP --> APP
+        APP --> RE
+        RE --> JUD
+    end
+
+    subgraph TRUTH["Ground truth · deterministic, the model cannot reach it"]
+        direction LR
+        ORACLE["<b>Oracle</b><br/>mypy --strict, as a subprocess"]
+        TRIAGE["<b>Triage</b><br/>annotation · defect · config<br/>cascading · unknown"]
+        GUARD["<b>Guard</b><br/>damage a falling<br/>error count can hide"]
+        ORACLE --> TRIAGE
+    end
+
+    MODEL["<b>Model</b><br/>Nemotron via NIM<br/>any OpenAI-compatible endpoint"]
+
+    CLI --> LOOP
+    WORK --> SESS
+    PROP --> MODEL
+    PRE --> ORACLE
+    RE --> ORACLE
+    TRIAGE --> JUD
+    JUD --> GUARD
+
+    MEM[("<b>Memory</b><br/>SQLite checkpoint · within a run<br/>state.json in the target · across runs")]
+    OBS["<b>Observability</b><br/>LangSmith"]
+
+    LOOP <--> MEM
+    MODEL -.-> OBS
+    LOOP -.-> OBS
+
+    classDef untrusted stroke-width:3px,stroke-dasharray:6 4
+    class MODEL untrusted
+```
+
+The dashed box is the only component that is not deterministic, and it is the only one with no path into the ground-truth group. Everything it produces is checked by something it cannot reach: the oracle for what the error count actually did, the triage rules for whether the work was ever the agent's to attempt, the guard for the damage a falling error count can hide.
+
+---
+
 ## How it works
 
 One session, one file:
