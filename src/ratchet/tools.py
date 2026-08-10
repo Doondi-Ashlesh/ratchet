@@ -63,6 +63,39 @@ def write_file(path: str, content: str) -> ToolResult:
     return ToolResult(True, {"path": str(p), "bytes": len(content)})
 
 
+def replace_once(content: str, old: str, new: str) -> tuple[str, ToolResult]:
+    """Anchored replacement. Refuses anything it cannot place unambiguously.
+
+    Uniqueness is the whole safety property. A patch that matches in two places
+    is applied to the wrong one roughly half the time, and the result usually
+    still parses - which makes it a silent corruption rather than a caught one.
+    Refusing is the difference between a failed tool call the agent can retry and
+    a bad edit nobody notices.
+
+    Returns the candidate content and a result; on failure the content is the
+    unmodified original, so a caller that ignores `ok` cannot write damage.
+    """
+    if not old:
+        return content, ToolResult(
+            False, error_type="empty_anchor",
+            error_message="old_string must not be empty; use write_file to replace a whole file")
+    if old == new:
+        return content, ToolResult(
+            False, error_type="no_op", error_message="old_string and new_string are identical")
+
+    found = content.count(old)
+    if found == 0:
+        return content, ToolResult(
+            False, error_type="not_found",
+            error_message="old_string does not appear in the file; read it again and quote it exactly")
+    if found > 1:
+        return content, ToolResult(
+            False, error_type="not_unique",
+            error_message=f"old_string appears {found} times; include surrounding lines to make it unique")
+
+    return content.replace(old, new, 1), ToolResult(True, {"replacements": 1})
+
+
 #3 Oracle :mypy tool
 
 def run_mypy(target: str, strict: bool = True) -> ToolResult:
@@ -142,3 +175,122 @@ def _tally(values: Iterable[str]) -> dict[str, int]:
     for v in values:
         out[v] = out.get(v, 0) + 1
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+#5 The schemas the model sees
+
+# Written by hand rather than generated from the signatures. The description is a
+# prompt, not documentation: it is the only place a constraint can be stated before
+# the model acts, and it needs wording chosen for a reader who will look for the
+# cheapest way to satisfy it. A generator would emit the type and drop exactly that.
+
+SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read a UTF-8 text file and return its exact contents. Read a file "
+                "before writing it, and read it again after writing if you need to "
+                "know what is actually on disk."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Path to an existing file."}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Overwrite an existing file with complete new contents. Cannot create "
+                "files. The write is checked before it lands: if it is rejected the "
+                "file on disk is unchanged and the reason is returned to you. A "
+                "rejected write is information, not a dead end. Fix the stated problem "
+                "and write again."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to an existing file."},
+                    "content": {
+                        "type": "string",
+                        "description": "The COMPLETE new file. Not a patch, not an excerpt.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace one exact passage of the file. PREFER THIS over write_file: "
+                "it is far cheaper and cannot corrupt the parts you did not touch. "
+                "old_string must appear EXACTLY ONCE - include the surrounding lines "
+                "if it does not. Whitespace and indentation must match exactly."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to an existing file."},
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to replace, quoted verbatim from the file.",
+                    },
+                    "new_string": {"type": "string", "description": "Text to put in its place."},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_work",
+            "description": (
+                "Type-check and report whether your work WOULD BE ACCEPTED, using the "
+                "exact rule that will judge you: the annotation count must fall, and "
+                "no other category may rise anywhere in the package. Returns the "
+                "verdict, the errors remaining in your file, and any NEW errors your "
+                "edit caused in other files. Call this before you finish. If it says "
+                "rejected, you are not done."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+TOOL_NAMES = frozenset(s["function"]["name"] for s in SCHEMAS)
+
+
+def as_json(result: ToolResult, *, limit: int = 8000) -> str:
+    """Render a ToolResult as the string handed back to the model.
+
+    Truncated by length because a tool result goes into the transcript and stays
+    there for the rest of the trajectory. One unbounded mypy dump costs its size on
+    every subsequent turn, not once. Truncation is announced rather than silent: a
+    model that cannot tell a short file from a clipped one will confidently rewrite
+    the half it can see and delete the half it cannot.
+    """
+    payload: dict[str, Any] = {"ok": result.ok}
+    if result.ok:
+        payload.update(result.data)
+    else:
+        payload["error"] = result.error_type
+        payload["message"] = result.error_message
+
+    body = json.dumps(payload, default=str)
+    if len(body) <= limit:
+        return body
+    return json.dumps({
+        "ok": result.ok,
+        "truncated": True,
+        "note": f"result was {len(body)} chars, showing the first {limit}",
+        "partial": body[:limit],
+    })

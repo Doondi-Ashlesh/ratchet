@@ -482,3 +482,62 @@ interrupting mid-session abandons a proposal nobody has judged.
 This is the first fix in this log that was found by reading a trace rather than
 by reading a diff. Three runs were spent guessing at model timeouts before
 tracing worked; the answer took one query afterwards.
+
+---
+
+## 024 · Giving the model tools changed the failure mode, not just the interface
+
+**observed** — First live trajectory of the tool-calling agent, on an 85-line
+file with 5 annotation errors. Eight turns, `37,602` input and `17,390` output
+tokens, and **zero progress**: `errors 5 -> 5`, file byte-identical at the end.
+Two `write_file` calls were rejected by the guard with the same message,
+`the file no longer parses: line 26: unterminated string literal`.
+
+The single-shot agent had been fixing files of this size in one or two calls.
+
+**first wrong diagnosis** — This is the signature of a truncated response
+(log 019), so the assumption was that the model was being cut off mid-write.
+It was not. `finish_reason` was `tool_calls`, not `length`, and the file
+continued correctly for 59 lines *after* the corruption. Nothing was cut off.
+
+**root cause** — The channel, not the model. Comparing the same line across a
+successful write and a failed one:
+
+```
+ok    ...pip\s+install\s+(.+)\")\n_VERSION = re.compile(...
+bad   ...pip\s+install\s+(.+)_VERSION = re.compile(...
+```
+
+A `\")` and a newline are missing. Returning a whole source file as a JSON tool
+argument requires the model to escape every quote and backslash correctly across
+thousands of tokens, and this file is unusually dense with regex literals
+(`r"(?:^|[!\s])pip\s+install\s+(.+)"`). It dropped an escape sequence. The same
+file returned as plain text by `propose()` needs no escaping and has never failed
+this way, so the defect belongs to how the content was carried, not to the model's
+understanding of the task.
+
+**why the retry did not help** — It emitted the identical corruption twice, at
+the same line. At temperature 0 the same context regenerates the same tokens, so
+feeding back "line 26 is unterminated" cannot fix it: this is not a reasoning
+error the model can act on. A bounded retry loop assumes attempts are independent
+draws. Where the failure is deterministic, retrying is just paying twice.
+
+Note the tension with log 013, which recorded that temperature 0 is *not*
+determinism. Both hold. A temp-0 call is not guaranteed to repeat, and it repeats
+often enough that a retry strategy cannot rely on getting a different answer.
+
+**class fix** — Not yet applied; recorded before choosing, because the obvious fix
+is the wrong one. Making `write_file` accept a patch instead of a whole file
+shrinks the escaping surface, but does not remove it, and it trades one corruption
+class for a harder one: a mis-anchored patch that still parses.
+
+What the evidence actually supports is narrower. First, the guard has to run on
+every write and not only at the end, which it already does — that is the only
+reason this trajectory cost tokens instead of leaving a broken file on disk.
+Second, a retry after a deterministic failure must change something about the
+request, or it is not a retry.
+
+**what held** — Both bad writes were refused, the file on disk was never touched,
+and the trajectory ended byte-identical to its start. The agent gained an action
+space and the ability to corrupt a file, and the checks written for the
+single-shot agent caught it on the first live run without modification.

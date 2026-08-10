@@ -25,17 +25,21 @@ Configure:
 """
 from __future__ import annotations
 
+import json
 import os
 import random
 import time
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Any, TypeVar
 
 from langsmith import traceable
 
 Completer = Callable[[str], str]
+Conversant = Callable[[list[dict[str, Any]]], "Reply"]
 
 _injected: Completer | None = None
+_injected_chat: Conversant | None = None
 _usage = {"input": 0, "output": 0, "calls": 0}
 
 
@@ -198,6 +202,33 @@ def _backoff(attempt: int) -> float:
     return float(base * (2**attempt) * (0.5 + random.random() / 2))
 
 
+_T = TypeVar("_T")
+
+
+def _with_retries(call: Callable[[], _T]) -> _T:
+    """Run `call`, retrying only what a retry can fix.
+
+    Shared by both entry points. Duplicating this per call shape is how one of them
+    ends up with a retry policy the other quietly lacks.
+    """
+    last: BaseException | None = None
+    for attempt in range(_max_attempts()):
+        try:
+            return call()
+        except Truncated:
+            raise                                   # a budget problem; retrying repeats it
+        except Exception as e:
+            if not _is_transient(e):
+                raise
+            last = e
+            if attempt < _max_attempts() - 1:
+                _sleep(_backoff(attempt))
+    raise ModelUnavailable(
+        f"{model_id()} failed {_max_attempts()}x "
+        f"(last: {type(last).__name__ if last else 'unknown'})"
+    ) from last
+
+
 def complete(prompt: str) -> str:
     """One completion. Returns the raw text, unparsed.
 
@@ -211,23 +242,13 @@ def complete(prompt: str) -> str:
     if _injected is not None:
         _usage["calls"] += 1
         return _injected(prompt)
+    # A nested def rather than a lambda: `@traceable` types the call as a protocol,
+    # and mypy resolves its return through a normal call but not through a lambda,
+    # which silently widens the retry helper's type variable to Any.
+    def attempt() -> str:
+        return _live_call(prompt)
 
-    last: BaseException | None = None
-    for attempt in range(_max_attempts()):
-        try:
-            return _live_call(prompt)
-        except Truncated:
-            raise                                   # a budget problem; retrying repeats it
-        except Exception as e:
-            if not _is_transient(e):
-                raise
-            last = e
-            if attempt < _max_attempts() - 1:
-                _sleep(_backoff(attempt))
-    raise ModelUnavailable(
-        f"{model_id()} failed {_max_attempts()}x "
-        f"(last: {type(last).__name__ if last else 'unknown'})"
-    ) from last
+    return _with_retries(attempt)
 
 
 @traceable(name="complete", run_type="chain")
@@ -263,3 +284,105 @@ def _live_call(prompt: str) -> str:
         )
 
     return str(choice.message.content or "")
+
+
+# ── tool calling ──────────────────────────────────────────────────────────────
+# The agent loop needs the model to choose actions rather than return prose. The
+# provider's objects are converted here and nowhere else: the SDK's message shape
+# is a dependency this module already carries, and letting it leak into the agent
+# would mean a provider change edits the agent too.
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """One action the model asked for.
+
+    `arguments` is already parsed. `malformed` is set when it could not be, which
+    is an outcome rather than an error: the model emitted something, the loop must
+    tell it what was wrong, and raising here would end a trajectory over a stray
+    brace.
+    """
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+    malformed: str = ""
+
+
+@dataclass(frozen=True)
+class Reply:
+    """One turn from the model. No tool calls means it considers itself finished."""
+
+    content: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+
+    @property
+    def done(self) -> bool:
+        return not self.tool_calls
+
+
+def set_conversant(fn: Conversant | None) -> None:
+    """Inject a fake tool-calling model, or None to restore live calls."""
+    global _injected_chat
+    _injected_chat = fn
+
+
+def converse(messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]]) -> Reply:
+    """One turn of a tool-calling conversation.
+
+    Stateless on purpose. The transcript belongs to the caller, because the caller
+    is the one that has to decide what to drop when it grows too long, and that
+    decision needs to be visible where the loop is rather than hidden in here.
+    """
+    if _injected_chat is not None:
+        _usage["calls"] += 1
+        return _injected_chat(list(messages))
+    def attempt() -> Reply:
+        return _live_chat(list(messages), list(tools))
+
+    return _with_retries(attempt)
+
+
+def _parse_arguments(raw: str) -> tuple[dict[str, Any], str]:
+    try:
+        parsed = json.loads(raw or "{}")
+    except json.JSONDecodeError as e:
+        return {}, f"arguments were not valid JSON: {e}"
+    if not isinstance(parsed, dict):
+        return {}, f"arguments must be an object, got {type(parsed).__name__}"
+    return parsed, ""
+
+
+@traceable(name="turn", run_type="chain")
+def _live_chat(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Reply:
+    resp = _client().chat.completions.create(
+        model=model_id(),
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        temperature=0,
+    )
+
+    used = getattr(resp, "usage", None)
+    _usage["calls"] += 1
+    if used is not None:
+        _usage["input"] += int(getattr(used, "prompt_tokens", 0) or 0)
+        _usage["output"] += int(getattr(used, "completion_tokens", 0) or 0)
+
+    choice = resp.choices[0]
+
+    # A truncated turn is worse here than in `complete`. There, half a file arrives
+    # and is obviously unusable. Here the model may have been cut off mid-tool-call,
+    # so the arguments parse cleanly and describe an action it never finished
+    # choosing. Treating it as a normal turn would execute that.
+    if choice.finish_reason == "length":
+        raise Truncated(f"{model_id()} hit its output limit mid-turn")
+
+    calls = []
+    for call in choice.message.tool_calls or ():
+        arguments, malformed = _parse_arguments(call.function.arguments)
+        calls.append(
+            ToolCall(id=call.id, name=call.function.name, arguments=arguments, malformed=malformed)
+        )
+
+    return Reply(content=choice.message.content or "", tool_calls=tuple(calls))
