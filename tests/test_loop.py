@@ -15,8 +15,9 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from fake_model import FunctionModel
 
-from ratchet import history, loop, model
+from ratchet import history, llm, loop
 
 UNTYPED = "def f(x):\n    return x\n"
 GOOD = "def f(x: int) -> int:\n    return x\n"
@@ -26,7 +27,7 @@ SIDEWAYS = "def f(x: int) -> int:\n    return nope\n"
 @pytest.fixture(autouse=True)
 def _never_call_a_live_model() -> Iterator[None]:
     yield
-    model.set_completer(None)
+    llm.set_model(None)
 
 
 def _repo(tmp_path: Path, files: dict[str, str]) -> Path:
@@ -41,7 +42,7 @@ def _repo(tmp_path: Path, files: dict[str, str]) -> Path:
 
 def test_the_queue_drains_and_the_count_falls(tmp_path: Path) -> None:
     _repo(tmp_path, {"a.py": UNTYPED, "b.py": UNTYPED})
-    model.set_completer(lambda _: GOOD)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD))
 
     out = loop.run_loop(str(tmp_path))
 
@@ -53,7 +54,7 @@ def test_the_queue_drains_and_the_count_falls(tmp_path: Path) -> None:
 
 def test_max_files_bounds_the_run(tmp_path: Path) -> None:
     _repo(tmp_path, {"a.py": UNTYPED, "b.py": UNTYPED, "c.py": UNTYPED})
-    model.set_completer(lambda _: GOOD)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD))
 
     out = loop.run_loop(str(tmp_path), max_files=1)
 
@@ -70,7 +71,7 @@ def test_a_repeatedly_failing_file_is_not_dispatched_again(tmp_path: Path) -> No
     history.save(str(tmp_path), h)
 
     calls: list[str] = []
-    model.set_completer(lambda p: calls.append(p) or GOOD)
+    llm.set_model(FunctionModel(fn=lambda p: calls.append(p) or GOOD))
 
     out = loop.run_loop(str(tmp_path), max_failures=2)
 
@@ -85,7 +86,7 @@ def test_the_block_lifts_below_the_threshold(tmp_path: Path) -> None:
     h = history.History()
     h.record("a.py", kept=False, attempts=3, reason="regressed: unknown +2")
     history.save(str(tmp_path), h)
-    model.set_completer(lambda _: GOOD)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD))
 
     out = loop.run_loop(str(tmp_path), max_failures=2)
 
@@ -94,7 +95,7 @@ def test_the_block_lifts_below_the_threshold(tmp_path: Path) -> None:
 
 def test_a_run_writes_its_verdicts_to_committed_state(tmp_path: Path) -> None:
     _repo(tmp_path, {"a.py": UNTYPED})
-    model.set_completer(lambda _: GOOD)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD))
 
     loop.run_loop(str(tmp_path))
     h = history.load(str(tmp_path))
@@ -106,7 +107,7 @@ def test_a_run_writes_its_verdicts_to_committed_state(tmp_path: Path) -> None:
 def test_files_with_no_annotation_work_never_enter_the_queue(tmp_path: Path) -> None:
     _repo(tmp_path, {"clean.py": "x: int = 1\n"})
     calls: list[str] = []
-    model.set_completer(lambda p: calls.append(p) or GOOD)
+    llm.set_model(FunctionModel(fn=lambda p: calls.append(p) or GOOD))
 
     out = loop.run_loop(str(tmp_path))
 
@@ -117,7 +118,7 @@ def test_files_with_no_annotation_work_never_enter_the_queue(tmp_path: Path) -> 
 def test_a_run_where_nothing_succeeds_escalates(tmp_path: Path) -> None:
     """Exhausting every file is a result that needs a person, not a silent exit."""
     _repo(tmp_path, {"a.py": UNTYPED})
-    model.set_completer(lambda _: SIDEWAYS)
+    llm.set_model(FunctionModel(fn=lambda _: SIDEWAYS))
 
     out = loop.run_loop(str(tmp_path), max_attempts=1)
 
@@ -132,7 +133,7 @@ def test_the_worst_file_is_worked_first(tmp_path: Path) -> None:
         "one.py": UNTYPED,
         "three.py": "def a(x):\n    return x\ndef b(x):\n    return x\ndef c(x):\n    return x\n",
     })
-    model.set_completer(lambda _: GOOD)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD))
 
     out = loop.run_loop(str(tmp_path), max_files=1)
 
@@ -143,7 +144,7 @@ def test_a_run_resumes_from_its_checkpoint(tmp_path: Path) -> None:
     """The reason this is a graph and not a while loop. State survives the
     process, so a killed run continues rather than starting over."""
     _repo(tmp_path, {"a.py": UNTYPED, "b.py": UNTYPED})
-    model.set_completer(lambda _: GOOD)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD))
     db = str(tmp_path / "ckpt.sqlite")
 
     with loop.make_checkpointer(db) as saver:
@@ -167,7 +168,7 @@ def test_history_keys_use_forward_slashes_on_every_platform(tmp_path: Path) -> N
     Windows run writes `pkg\a.py` and a Linux run looks up `pkg/a.py`, so the
     same file appears twice and every skip rule quietly stops working."""
     _repo(tmp_path, {"pkg/a.py": UNTYPED})
-    model.set_completer(lambda _: GOOD)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD))
 
     loop.run_loop(str(tmp_path))
     keys = list(history.load(str(tmp_path)).files)
@@ -191,7 +192,7 @@ def test_the_deadline_stops_dispatch_and_keeps_what_was_earned(tmp_path: Path) -
             loop.time.sleep(0.05)
         return GOOD
 
-    model.set_completer(slow)
+    llm.set_model(FunctionModel(fn=slow))
 
     out = loop.run_loop(str(tmp_path), deadline_s=0.01)
 
@@ -205,7 +206,7 @@ def test_no_deadline_means_no_bound(tmp_path: Path) -> None:
     """Zero is off, not 'expire immediately' — the default must not silently
     stop a run from doing any work at all."""
     _repo(tmp_path, {"a.py": UNTYPED, "b.py": UNTYPED})
-    model.set_completer(lambda _: GOOD)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD))
 
     out = loop.run_loop(str(tmp_path), deadline_s=0.0)
 

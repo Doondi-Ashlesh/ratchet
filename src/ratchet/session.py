@@ -24,8 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ratchet.agent import propose
-from ratchet.agent import work as agent_work
 from ratchet.classify import Category, Classified, actionable, from_result
+from ratchet.coder import work as agent_work
 from ratchet.gate import Measurement, Verdict, judge
 from ratchet.guard import check as guard_check
 from ratchet.tools import read_file, run_mypy, write_file
@@ -186,7 +186,7 @@ def run_session(target: str, path: str, max_attempts: int = 3) -> SessionResult:
 
 
 def run_agent_session(
-    target: str, path: str, *, max_turns: int = 20, max_calls: int = 40
+    target: str, path: str, *, max_model_calls: int = 20, max_tool_calls: int = 40
 ) -> SessionResult:
     """One session where the model drives, for comparison against `run_session`.
 
@@ -215,15 +215,16 @@ def run_agent_session(
 
     try:
         trajectory = agent_work(
-            target, path, todo, before, max_turns=max_turns, max_calls=max_calls
+            target, path, todo, before,
+            max_model_calls=max_model_calls, max_tool_calls=max_tool_calls,
         )
 
-        history = [f"{s.tool}: {s.detail}" for s in trajectory.steps if not s.ok]
+        history = [f"{name}: {detail}" for name, ok, detail in trajectory.calls if not ok]
         if not trajectory.changed:
             return SessionResult(
                 path, False,
-                f"no change written ({trajectory.stopped}, {trajectory.turns} turns)",
-                before, before, _NO_CHANGE, "", trajectory.turns, tuple(history),
+                f"no change written ({trajectory.stopped}, {trajectory.steps} steps)",
+                before, before, _NO_CHANGE, "", trajectory.steps, tuple(history),
             )
 
         after_diags = from_result(run_mypy(target))
@@ -233,13 +234,13 @@ def run_agent_session(
         if verdict.accepted:
             return SessionResult(
                 path, True, verdict.reason, before, after, verdict.deltas,
-                trajectory.final, trajectory.turns, tuple(history),
+                trajectory.final, trajectory.steps, tuple(history),
             )
 
         write_file(path, original)
         return SessionResult(
             path, False, verdict.reason, before, after, verdict.deltas,
-            trajectory.final, trajectory.turns, tuple(history),
+            trajectory.final, trajectory.steps, tuple(history),
         )
 
     except BaseException:

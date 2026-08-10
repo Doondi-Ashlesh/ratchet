@@ -7,7 +7,10 @@ dependencies=[]
 
 [project.optional-dependencies]
 agent = [
-  "openai>=1.40",
+  # The agent loop, its tools and its bounds are all upstream. `openai` is gone:
+  # nothing here speaks to a provider directly any more.
+  "langchain>=1.0",
+  "langchain-nvidia-ai-endpoints>=1.4",
   "langgraph>=1.0",
   "langgraph-checkpoint-sqlite>=2.0",
   "langsmith>=0.1",

@@ -15,8 +15,9 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from fake_model import FunctionModel
 
-from ratchet import model, session
+from ratchet import llm, session
 from ratchet.session import run_session
 
 UNTYPED = "def f(x):\n    return x\n"
@@ -31,7 +32,7 @@ SIDEWAYS_FIX = "def f(x: int) -> int:\n    return nope\n"
 @pytest.fixture(autouse=True)
 def _never_call_a_live_model() -> Iterator[None]:
     yield
-    model.set_completer(None)
+    llm.set_model(None)
 
 
 def _write(p: Path, text: str) -> None:
@@ -54,7 +55,7 @@ def test_a_file_with_no_annotation_work_is_left_alone(tmp_path: Path) -> None:
 def test_a_good_fix_is_kept(tmp_path: Path) -> None:
     p = tmp_path / "a.py"
     _write(p, UNTYPED)
-    model.set_completer(lambda _: GOOD_FIX)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD_FIX))
 
     result = run_session(str(tmp_path), str(p))
 
@@ -76,7 +77,7 @@ def test_a_sideways_fix_is_reverted_byte_for_byte(tmp_path: Path) -> None:
     p = tmp_path / "a.py"
     p.write_bytes(b"def f(x):\r\n    return x\r\n")   # CRLF on purpose
     before = p.read_bytes()
-    model.set_completer(lambda _: SIDEWAYS_FIX)
+    llm.set_model(FunctionModel(fn=lambda _: SIDEWAYS_FIX))
 
     result = run_session(str(tmp_path), str(p))
 
@@ -94,7 +95,7 @@ def test_a_model_that_proposes_nothing_touches_no_files(tmp_path: Path) -> None:
     p = tmp_path / "a.py"
     _write(p, UNTYPED)
     before = p.read_bytes()
-    model.set_completer(lambda _: UNTYPED)
+    llm.set_model(FunctionModel(fn=lambda _: UNTYPED))
 
     result = run_session(str(tmp_path), str(p))
 
@@ -110,7 +111,7 @@ def test_the_file_is_restored_if_measuring_blows_up(
     p = tmp_path / "a.py"
     _write(p, UNTYPED)
     before = p.read_bytes()
-    model.set_completer(lambda _: GOOD_FIX)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD_FIX))
 
     calls = {"n": 0}
     real = session.run_mypy
@@ -135,7 +136,7 @@ def test_the_session_measures_the_whole_target_not_just_the_file(tmp_path: Path)
     p = tmp_path / "a.py"
     _write(p, UNTYPED)
     _write(tmp_path / "other.py", "def g(y):\n    return y\n")
-    model.set_completer(lambda _: GOOD_FIX)
+    llm.set_model(FunctionModel(fn=lambda _: GOOD_FIX))
 
     result = run_session(str(tmp_path), str(p))
 
@@ -152,7 +153,7 @@ def test_a_rejected_attempt_is_retried_with_feedback(tmp_path: Path) -> None:
         prompts.append(prompt)
         return SIDEWAYS_FIX if len(prompts) == 1 else GOOD_FIX
 
-    model.set_completer(completer)
+    llm.set_model(FunctionModel(fn=completer))
 
     result = run_session(str(tmp_path), str(p))
 
@@ -175,7 +176,7 @@ def test_each_attempt_starts_from_the_original_file(tmp_path: Path) -> None:
         prompts.append(prompt)
         return SIDEWAYS_FIX if len(prompts) == 1 else GOOD_FIX
 
-    model.set_completer(completer)
+    llm.set_model(FunctionModel(fn=completer))
 
     run_session(str(tmp_path), str(p))
 
@@ -194,7 +195,7 @@ def test_repeated_failure_exhausts_and_escalates(tmp_path: Path) -> None:
     def completer(prompt: str) -> str:
         return SIDEWAYS_FIX
 
-    model.set_completer(completer)
+    llm.set_model(FunctionModel(fn=completer))
 
     result = run_session(str(tmp_path), str(p), max_attempts=2)
 
