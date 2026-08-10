@@ -233,3 +233,93 @@ def test_trimming_keeps_the_task_and_drops_whole_exchanges() -> None:
     assert trimmed[1]["content"] == "task"
     assert trimmed[2]["role"] == "assistant", "never starts with an orphaned tool result"
     assert len(trimmed) < len(messages)
+
+
+# ── the session wrapper ───────────────────────────────────────────────────────
+# The agent writes the file itself, so the property that matters is that a
+# trajectory the gate refuses leaves nothing behind.
+
+
+def _repo(tmp_path: Path, files: dict[str, str]) -> str:
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for name, body in files.items():
+        p = tmp_path / name
+        with p.open("w", encoding="utf-8", newline="") as fh:
+            fh.write(body)
+    return str(tmp_path)
+
+
+def test_an_accepted_trajectory_keeps_the_agents_work(tmp_path: Path) -> None:
+    from ratchet.session import run_agent_session
+
+    target = _repo(tmp_path, {"a.py": UNTYPED})
+    path = str(tmp_path / "a.py")
+    model.set_conversant(_script(
+        model.Reply(tool_calls=(_call("write_file", path=path, content=GOOD),)),
+        model.Reply(content="done"),
+    ))
+
+    result = run_agent_session(target, path)
+
+    assert result.kept
+    assert Path(path).read_text(encoding="utf-8") == GOOD
+
+
+def test_a_rejected_trajectory_restores_the_file(tmp_path: Path) -> None:
+    """The agent wrote real changes to disk across several turns. A refused verdict
+    has to undo all of them, not the last one."""
+    from ratchet.session import run_agent_session
+
+    sideways = "import nope\n\ndef f(x: int) -> int:\n    return x\n"
+    target = _repo(tmp_path, {"a.py": UNTYPED})
+    path = str(tmp_path / "a.py")
+    model.set_conversant(_script(
+        model.Reply(tool_calls=(_call("write_file", path=path, content=GOOD),)),
+        model.Reply(tool_calls=(_call("write_file", path=path, content=sideways),)),
+        model.Reply(content="done"),
+    ))
+
+    result = run_agent_session(target, path)
+
+    assert not result.kept
+    assert Path(path).read_text(encoding="utf-8") == UNTYPED
+
+
+def test_a_trajectory_that_wrote_nothing_is_not_a_rejection(tmp_path: Path) -> None:
+    """No change and a bad change are different outcomes, and collapsing them
+    would make the accept rate unreadable."""
+    from ratchet.session import run_agent_session
+
+    target = _repo(tmp_path, {"a.py": UNTYPED})
+    path = str(tmp_path / "a.py")
+    model.set_conversant(_script(model.Reply(content="I looked and did nothing")))
+
+    result = run_agent_session(target, path)
+
+    assert not result.kept
+    assert "no change written" in result.reason
+    assert Path(path).read_text(encoding="utf-8") == UNTYPED
+
+
+def test_a_crash_mid_trajectory_still_restores(tmp_path: Path) -> None:
+    """The revert is unconditional. A measurement that blows up must not leave the
+    agent's edits on disk."""
+    from ratchet.session import run_agent_session
+
+    target = _repo(tmp_path, {"a.py": UNTYPED})
+    path = str(tmp_path / "a.py")
+    calls = {"n": 0}
+
+    def conversant(_m: list[dict[str, Any]]) -> model.Reply:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return model.Reply(tool_calls=(_call("write_file", path=path, content=GOOD),))
+        raise RuntimeError("boom")
+
+    model.set_conversant(conversant)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_agent_session(target, path)
+
+    assert Path(path).read_text(encoding="utf-8") == UNTYPED

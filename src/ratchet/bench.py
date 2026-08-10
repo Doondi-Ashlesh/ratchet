@@ -23,7 +23,7 @@ from pathlib import Path
 
 from ratchet import model
 from ratchet.classify import actionable, from_result
-from ratchet.session import run_session
+from ratchet.session import run_agent_session, run_session
 from ratchet.tools import run_mypy
 
 
@@ -55,6 +55,7 @@ class BenchReport:
     target: str
     trials: tuple[Trial, ...]
     seconds: float
+    mode: str = "single"
 
     @property
     def accepted(self) -> int:
@@ -131,8 +132,18 @@ def run_bench(
     max_files: int = 20,
     max_attempts: int = 3,
     on_trial: Callable[[Trial], None] | None = None,
+    mode: str = "single",
 ) -> BenchReport:
-    """One session per file, restoring the file after each so trials are independent."""
+    """One session per file, restoring the file after each so trials are independent.
+
+    `mode` selects which agent produces the candidate: "single" for one prompt and
+    one file back, "agent" for the tool-calling loop. The comparison is the point.
+    Both are judged by the same gate on the same files in the same order, so a
+    difference in accept rate is a difference between the agents and not between
+    two benchmarks that happen to share a name.
+    """
+    if mode not in ("single", "agent"):
+        raise ValueError(f"mode must be 'single' or 'agent', got {mode!r}")
     root = _repo_root(target)
     _require_clean(root)
 
@@ -143,7 +154,11 @@ def run_bench(
         model.reset_usage()
         t0 = time.monotonic()
         try:
-            result = run_session(target, path, max_attempts=max_attempts)
+            result = (
+                run_session(target, path, max_attempts=max_attempts)
+                if mode == "single"
+                else run_agent_session(target, path)
+            )
         finally:
             # Restore regardless of outcome, including on a crash. Every trial has
             # to start from the same baseline or the numbers mean nothing.
@@ -166,7 +181,8 @@ def run_bench(
             on_trial(trial)
 
     return BenchReport(
-        target=target, trials=tuple(trials), seconds=round(time.monotonic() - started, 1)
+        target=target, trials=tuple(trials), seconds=round(time.monotonic() - started, 1),
+        mode=mode,
     )
 
 

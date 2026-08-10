@@ -66,7 +66,7 @@ def _report(path: str, counts: Mapping[str, int], total: int) -> str:
     return "\n".join(lines)
 
 
-def _bench(path: str, max_files: int, max_attempts: int, as_json: bool) -> int:
+def _bench(path: str, max_files: int, max_attempts: int, as_json: bool, mode: str) -> int:
     """Run the benchmark, streaming each trial so a long run is not silent."""
 
     def announce(t: Trial) -> None:
@@ -75,7 +75,7 @@ def _bench(path: str, max_files: int, max_attempts: int, as_json: bool) -> int:
             print(f"  {'keep' if t.kept else 'drop'}  {t.file}  ({t.attempts} attempt{plural})")
 
     try:
-        report = run_bench(path, max_files, max_attempts, on_trial=announce)
+        report = run_bench(path, max_files, max_attempts, on_trial=announce, mode=mode)
     except (NotAGitRepo, DirtyTree) as e:
         print(f"ratchet: {e}", file=sys.stderr)
         return EXIT_TOOL_FAILED
@@ -83,6 +83,7 @@ def _bench(path: str, max_files: int, max_attempts: int, as_json: bool) -> int:
     if as_json:
         print(json.dumps({
             "target": report.target,
+            "mode": report.mode,
             "seconds": report.seconds,
             "accepted": report.accepted,
             "accept_rate": round(report.accept_rate, 4),
@@ -187,6 +188,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     bench.add_argument("path", help="package to benchmark against")
     bench.add_argument("--max-files", type=int, default=20)
     bench.add_argument("--max-attempts", type=int, default=3)
+    bench.add_argument("--mode", choices=["single", "agent"], default="single",
+                       help="single = one prompt, one file back; agent = the tool-calling loop")
     bench.add_argument("--json", action="store_true", help="machine-readable output")
 
     run = sub.add_parser("run", help="work through a codebase, one file per session")
@@ -208,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "bench":
-        return _bench(args.path, args.max_files, args.max_attempts, args.json)
+        return _bench(args.path, args.max_files, args.max_attempts, args.json, args.mode)
 
     if args.command == "run":
         return _run(args)

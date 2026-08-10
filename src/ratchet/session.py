@@ -24,10 +24,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ratchet.agent import propose
+from ratchet.agent import work as agent_work
 from ratchet.classify import Category, Classified, actionable, from_result
 from ratchet.gate import Measurement, Verdict, judge
 from ratchet.guard import check as guard_check
-from ratchet.tools import run_mypy, write_file
+from ratchet.tools import read_file, run_mypy, write_file
 
 _NO_CHANGE: Mapping[str, int] = {c.value: 0 for c in Category}
 
@@ -182,3 +183,63 @@ def run_session(target: str, path: str, max_attempts: int = 3) -> SessionResult:
             # is unconditional here; the caller can retry from a known state.
             write_file(path, proposal.original)
             raise
+
+
+def run_agent_session(
+    target: str, path: str, *, max_turns: int = 8, max_calls: int = 20
+) -> SessionResult:
+    """One session where the model drives, for comparison against `run_session`.
+
+    Same contract, different middle. The agent writes the file itself instead of
+    returning one, so there is no separate apply step and no retry loop: a
+    trajectory already contains its own retries, and the model saw the guard's
+    objection at the moment it was raised rather than one attempt later.
+
+    What does not change is the part that matters. The file is snapshotted before
+    the agent runs, the same gate judges the same measurement afterwards, and
+    anything short of an accepted verdict restores the snapshot byte for byte. The
+    agent is a different way of producing a candidate, not a different standard for
+    accepting one.
+    """
+    before_diags = from_result(run_mypy(target))
+    before = Measurement.of(before_diags)
+
+    todo = [c for c in actionable(before_diags) if _same_file(c.file, path)]
+    if not todo:
+        return _unchanged(path, "no annotation work in this file", before)
+
+    read = read_file(path)
+    if not read.ok:
+        return _unchanged(path, f"{read.error_type}: {read.error_message}", before)
+    original = str(read.data["content"])
+
+    try:
+        trajectory = agent_work(target, path, todo, max_turns=max_turns, max_calls=max_calls)
+
+        history = [f"{s.tool}: {s.detail}" for s in trajectory.steps if not s.ok]
+        if not trajectory.changed:
+            return SessionResult(
+                path, False,
+                f"no change written ({trajectory.stopped}, {trajectory.turns} turns)",
+                before, before, _NO_CHANGE, "", trajectory.turns, tuple(history),
+            )
+
+        after_diags = from_result(run_mypy(target))
+        after = Measurement.of(after_diags)
+        verdict = judge(before, after, Category.ANNOTATION)
+
+        if verdict.accepted:
+            return SessionResult(
+                path, True, verdict.reason, before, after, verdict.deltas,
+                trajectory.final, trajectory.turns, tuple(history),
+            )
+
+        write_file(path, original)
+        return SessionResult(
+            path, False, verdict.reason, before, after, verdict.deltas,
+            trajectory.final, trajectory.turns, tuple(history),
+        )
+
+    except BaseException:
+        write_file(path, original)
+        raise
