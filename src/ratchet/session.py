@@ -186,7 +186,7 @@ def run_session(target: str, path: str, max_attempts: int = 3) -> SessionResult:
 
 
 def run_agent_session(
-    target: str, path: str, *, max_turns: int = 8, max_calls: int = 20
+    target: str, path: str, *, max_turns: int = 20, max_calls: int = 40
 ) -> SessionResult:
     """One session where the model drives, for comparison against `run_session`.
 
@@ -214,7 +214,9 @@ def run_agent_session(
     original = str(read.data["content"])
 
     try:
-        trajectory = agent_work(target, path, todo, max_turns=max_turns, max_calls=max_calls)
+        trajectory = agent_work(
+            target, path, todo, before, max_turns=max_turns, max_calls=max_calls
+        )
 
         history = [f"{s.tool}: {s.detail}" for s in trajectory.steps if not s.ok]
         if not trajectory.changed:

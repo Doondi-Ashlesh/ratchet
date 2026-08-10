@@ -63,6 +63,39 @@ def write_file(path: str, content: str) -> ToolResult:
     return ToolResult(True, {"path": str(p), "bytes": len(content)})
 
 
+def replace_once(content: str, old: str, new: str) -> tuple[str, ToolResult]:
+    """Anchored replacement. Refuses anything it cannot place unambiguously.
+
+    Uniqueness is the whole safety property. A patch that matches in two places
+    is applied to the wrong one roughly half the time, and the result usually
+    still parses - which makes it a silent corruption rather than a caught one.
+    Refusing is the difference between a failed tool call the agent can retry and
+    a bad edit nobody notices.
+
+    Returns the candidate content and a result; on failure the content is the
+    unmodified original, so a caller that ignores `ok` cannot write damage.
+    """
+    if not old:
+        return content, ToolResult(
+            False, error_type="empty_anchor",
+            error_message="old_string must not be empty; use write_file to replace a whole file")
+    if old == new:
+        return content, ToolResult(
+            False, error_type="no_op", error_message="old_string and new_string are identical")
+
+    found = content.count(old)
+    if found == 0:
+        return content, ToolResult(
+            False, error_type="not_found",
+            error_message="old_string does not appear in the file; read it again and quote it exactly")
+    if found > 1:
+        return content, ToolResult(
+            False, error_type="not_unique",
+            error_message=f"old_string appears {found} times; include surrounding lines to make it unique")
+
+    return content.replace(old, new, 1), ToolResult(True, {"replacements": 1})
+
+
 #3 Oracle :mypy tool
 
 def run_mypy(target: str, strict: bool = True) -> ToolResult:
@@ -195,17 +228,40 @@ SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "run_mypy",
+            "name": "edit_file",
             "description": (
-                "Type-check with mypy --strict and return the diagnostics. Use this to "
-                "check your own work before you finish. Note that silencing a "
-                "diagnostic is not the same as fixing it."
+                "Replace one exact passage of the file. PREFER THIS over write_file: "
+                "it is far cheaper and cannot corrupt the parts you did not touch. "
+                "old_string must appear EXACTLY ONCE - include the surrounding lines "
+                "if it does not. Whitespace and indentation must match exactly."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"target": {"type": "string", "description": "File or directory."}},
-                "required": ["target"],
+                "properties": {
+                    "path": {"type": "string", "description": "Path to an existing file."},
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to replace, quoted verbatim from the file.",
+                    },
+                    "new_string": {"type": "string", "description": "Text to put in its place."},
+                },
+                "required": ["path", "old_string", "new_string"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_work",
+            "description": (
+                "Type-check and report whether your work WOULD BE ACCEPTED, using the "
+                "exact rule that will judge you: the annotation count must fall, and "
+                "no other category may rise anywhere in the package. Returns the "
+                "verdict, the errors remaining in your file, and any NEW errors your "
+                "edit caused in other files. Call this before you finish. If it says "
+                "rejected, you are not done."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]

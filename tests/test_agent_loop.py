@@ -323,3 +323,122 @@ def test_a_crash_mid_trajectory_still_restores(tmp_path: Path) -> None:
         run_agent_session(target, path)
 
     assert Path(path).read_text(encoding="utf-8") == UNTYPED
+
+
+# ── anchored edits and the real gate ──────────────────────────────────────────
+
+
+def test_an_edit_lands_when_the_anchor_is_unique(tmp_path: Path) -> None:
+    target, path = _target(tmp_path)
+    model.set_conversant(_script(
+        model.Reply(tool_calls=(_call("edit_file", path=path,
+                                      old_string="def f(x):", new_string="def f(x: int) -> int:"),)),
+        model.Reply(content="done"),
+    ))
+
+    t = agent.work(target, path, _diag(path))
+
+    assert Path(path).read_text(encoding="utf-8") == GOOD
+    assert t.changed
+
+
+def test_an_ambiguous_anchor_is_refused(tmp_path: Path) -> None:
+    """Uniqueness is the safety property. A patch matching twice lands in the wrong
+    place about half the time, and usually still parses - a silent corruption rather
+    than a caught one."""
+    body = "def f(x):\n    return x\n\ndef g(y):\n    return x\n"
+    target, path = _target(tmp_path, body)
+    model.set_conversant(_script(
+        model.Reply(tool_calls=(_call("edit_file", path=path,
+                                      old_string="    return x", new_string="    return 0"),)),
+        model.Reply(content="stopped"),
+    ))
+
+    t = agent.work(target, path, _diag(path))
+
+    assert Path(path).read_text(encoding="utf-8") == body, "nothing was written"
+    assert "not_unique" in t.steps[0].detail
+
+
+def test_an_edit_that_breaks_the_file_is_refused_like_a_write(tmp_path: Path) -> None:
+    """Both paths to disk go through the guard, so a cheaper tool is not a way
+    around the checks."""
+    target, path = _target(tmp_path)
+    model.set_conversant(_script(
+        model.Reply(tool_calls=(_call("edit_file", path=path,
+                                      old_string="def f(x):", new_string="def f(x):  # type: ignore"),)),
+        model.Reply(content="stopped"),
+    ))
+
+    t = agent.work(target, path, _diag(path))
+
+    assert Path(path).read_text(encoding="utf-8") == UNTYPED
+    assert "rejected" in t.steps[0].detail
+
+
+def test_check_work_reports_the_gates_actual_verdict(tmp_path: Path) -> None:
+    """The bug this closes: the agent used to see only its own file's errors while
+    being judged on the whole package, so it optimised something it was not graded
+    on."""
+    target = _repo(tmp_path, {"a.py": UNTYPED})
+    path = str(tmp_path / "a.py")
+    seen: list[str] = []
+
+    # A change that fixes the annotation but breaks something else: exactly the
+    # case the agent used to be blind to, because the damage is not in its file.
+    sideways = "import nope\n\ndef f(x: int) -> int:\n    return x\n"
+    turns = {"n": 0}
+
+    def conversant(messages: list[dict[str, Any]]) -> model.Reply:
+        seen[:] = [str(m.get("content", "")) for m in messages if m.get("role") == "tool"]
+        turns["n"] += 1
+        if turns["n"] == 1:
+            return model.Reply(tool_calls=(_call("write_file", path=path, content=sideways),))
+        if turns["n"] == 2:
+            return model.Reply(tool_calls=(_call("check_work"),))
+        return model.Reply(content="I see what I broke")
+
+    model.set_conversant(conversant)
+    t = agent.work(target, path, _diag(path))
+
+    assert t.self_checked
+    assert any("REJECTED" in s for s in seen), "the verdict reaches the model, not just the harness"
+    assert any("categories_that_rose" in s for s in seen), "and it names what it broke"
+
+
+def test_the_loop_stops_as_soon_as_the_gate_accepts(tmp_path: Path) -> None:
+    """Continuing past acceptance can only lose it: the session keeps the file as it
+    stands at the end, not at its best moment."""
+    target = _repo(tmp_path, {"a.py": UNTYPED})
+    path = str(tmp_path / "a.py")
+    turns = {"n": 0}
+
+    def conversant(_m: list[dict[str, Any]]) -> model.Reply:
+        turns["n"] += 1
+        if turns["n"] == 1:
+            return model.Reply(tool_calls=(_call("write_file", path=path, content=GOOD),))
+        if turns["n"] == 2:
+            return model.Reply(tool_calls=(_call("check_work"),))
+        return model.Reply(tool_calls=(_call("write_file", path=path, content=UNTYPED),))
+
+    model.set_conversant(conversant)
+    t = agent.work(target, path, _diag(path), max_turns=10)
+
+    assert t.stopped == "accepted"
+    assert Path(path).read_text(encoding="utf-8") == GOOD, "the undo never ran"
+
+
+def test_the_file_is_given_not_fetched(tmp_path: Path) -> None:
+    """A trajectory spent five of eight turns re-reading a file it had been shown.
+    The content is in the opening message now, so turn one can be an edit."""
+    target, path = _target(tmp_path)
+    seen: list[str] = []
+
+    def conversant(messages: list[dict[str, Any]]) -> model.Reply:
+        seen.append(str(messages[1]["content"]))
+        return model.Reply(content="nothing to do")
+
+    model.set_conversant(conversant)
+    agent.work(target, path, _diag(path))
+
+    assert "def f(x):" in seen[0], "the file body is in the opening message"

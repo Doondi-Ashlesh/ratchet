@@ -23,10 +23,19 @@ from pathlib import Path
 from typing import Any
 
 from ratchet import model
-from ratchet.classify import Category, Classified
+from ratchet.classify import Category, Classified, from_result
+from ratchet.gate import Measurement, judge
 from ratchet.guard import check as guard_check
 from ratchet.model import ToolCall
-from ratchet.tools import SCHEMAS, ToolResult, as_json, read_file, run_mypy, write_file
+from ratchet.tools import (
+    SCHEMAS,
+    ToolResult,
+    as_json,
+    read_file,
+    replace_once,
+    run_mypy,
+    write_file,
+)
 
 _RULES = """You are adding missing type annotations to a Python file so that
 `mypy --strict` accepts it.
@@ -151,17 +160,34 @@ def propose(path: str, diagnostics: Sequence[Classified], feedback: str = "") ->
 _SYSTEM = """You are fixing missing type annotations in one Python file so that
 `mypy --strict` accepts it. You work by calling tools.
 
-The rules your work is judged against:
+PROCEDURE - follow it every time:
+1. The file's current contents are given to you below. You do not need to read it first.
+2. Make one targeted change with `edit_file`. Prefer many small edits to one large one.
+3. Call `check_work`.
+4. If it says REJECTED, fix what it names and go back to step 2.
+5. Only stop when `check_work` says ACCEPTED, or when it is clear you cannot get there.
+
+Stopping before `check_work` accepts means the work is thrown away. A partial fix
+scores exactly the same as no fix at all, so there is no reason to stop early.
+
+HOW YOU ARE JUDGED - the annotation count must FALL, and no other error category
+may RISE anywhere in the package. That second half is what usually fails:
+
+- A type you name but never import becomes a NEW error, not a fixed one.
+- Annotating a function makes its CALL SITES checkable, and errors can appear in
+  OTHER files as a result. `check_work` shows you those. They are your problem.
+- If a change you cannot avoid causes errors elsewhere, revert that one change and
+  fix the rest. Fixing four of five errors and being accepted beats fixing five and
+  being rejected.
+
+RULES - each of these is enforced by a check, not a preference. A write that
+breaks one is refused and never reaches the file:
 - Never add `# type: ignore`. Silencing a diagnostic is not fixing it.
 - Never use a bare `Any` or `object` as a whole annotation. `dict[str, Any]` is fine.
 - Never delete or rewrite code, comments or docstrings.
 - Never change what the code does at runtime.
-- Every type you name must already be imported, or you must add the import.
 
-You may only edit the one file named in the task. Read it before you write it.
-Check your work with run_mypy before you finish.
-
-When you are finished, reply with a short summary and make no further tool call.
+You may only edit the one file named in the task.
 """
 
 
@@ -201,7 +227,7 @@ class Trajectory:
     def self_checked(self) -> bool:
         """Did it verify before finishing? Asking for this in the prompt makes it
         likely; recording it is how you find out how likely."""
-        return any(s.tool == "run_mypy" for s in self.steps)
+        return any(s.tool == "check_work" for s in self.steps)
 
 
 class _Workspace:
@@ -213,11 +239,13 @@ class _Workspace:
     tool result, so the agent can correct itself rather than being terminated.
     """
 
-    def __init__(self, target: str, path: str, original: str) -> None:
+    def __init__(self, target: str, path: str, original: str, before: Measurement) -> None:
         self.target = Path(target).resolve()
         self.path = Path(path).resolve()
         self.original = original
+        self.before = before
         self.steps: list[Step] = []
+        self.accepted = False
 
     def _record(self, tool: str, result: ToolResult) -> str:
         detail = "" if result.ok else f"{result.error_type}: {result.error_message}"
@@ -239,7 +267,8 @@ class _Workspace:
         handler = {
             "read_file": self._read,
             "write_file": self._write,
-            "run_mypy": self._mypy,
+            "edit_file": self._edit,
+            "check_work": self._check,
         }.get(call.name)
         if handler is None:
             return self._record(
@@ -267,42 +296,79 @@ class _Workspace:
                 error_message=f"you may only edit {self.path}, not {raw}"))
 
         content = _normalize(_unfence(str(args.get("content", ""))), like=self.original)
+        return self._apply("write_file", content)
 
-        verdict = guard_check(self.original, content)
+    def _apply(self, tool: str, candidate: str) -> str:
+        """Guard, then write. The single path to disk, so no tool can bypass the check."""
+        verdict = guard_check(self.original, candidate)
         if not verdict.ok:
             # The write never reaches disk. The model is told why, in the same terms
-            # the gate would have used, while it can still act on it — a rejected
+            # the gate would have used, while it can still act on it - a rejected
             # write inside the trajectory is feedback; the same rejection after it
             # would just be a lost session.
-            return self._record("write_file", ToolResult(
+            return self._record(tool, ToolResult(
                 False, error_type="rejected", error_message=verdict.reason))
+        return self._record(tool, write_file(str(self.path), candidate))
 
-        return self._record("write_file", write_file(str(self.path), content))
+    def _edit(self, args: dict[str, Any]) -> str:
+        raw = str(args.get("path", "")) or str(self.path)
+        if Path(raw).resolve() != self.path:
+            return self._record("edit_file", ToolResult(
+                False, error_type="wrong_file",
+                error_message=f"you may only edit {self.path}, not {raw}"))
 
-    def _mypy(self, args: dict[str, Any]) -> str:
-        raw = str(args.get("target", "")) or str(self.path)
-        if not self._inside_target(raw):
-            return self._record("run_mypy", ToolResult(
-                False, error_type="outside_target",
-                error_message=f"{raw} is outside {self.target}"))
+        current = read_file(str(self.path))
+        if not current.ok:
+            return self._record("edit_file", current)
 
-        result = run_mypy(raw)
+        candidate, result = replace_once(
+            str(current.data["content"]),
+            str(args.get("old_string", "")),
+            str(args.get("new_string", "")),
+        )
         if not result.ok:
-            return self._record("run_mypy", result)
+            return self._record("edit_file", result)
+        return self._apply("edit_file", candidate)
 
-        # Filtered to the file under work. The agent was dispatched one file; the
-        # rest of the package's errors are not its business, and handing them over
-        # invites it to go fix them in a file the gate is not watching.
-        mine = [d for d in result.data.get("diagnostics", ()) if _same_file(d, self.path)]
-        return self._record("run_mypy", ToolResult(True, {
-            "file": str(self.path), "error_count": len(mine), "diagnostics": mine,
+    def _check(self, _args: dict[str, Any]) -> str:
+        """Run the actual gate and report its actual verdict.
+
+        This exists because the agent was previously shown a filtered view: the
+        errors in its own file. The gate judges the whole package and rejects if any
+        category rises anywhere, so an annotation that breaks a caller in a
+        neighbouring file was invisible to the agent and fatal at the end. It was
+        being graded on a measurement it could not see, which no amount of retrying
+        fixes.
+        """
+        after_diags = from_result(run_mypy(str(self.target)))
+        after = Measurement.of(after_diags)
+        verdict = judge(self.before, after, Category.ANNOTATION)
+        self.accepted = verdict.accepted
+
+        mine = [d for d in after_diags if _same_path(d.file, self.path)]
+        elsewhere = [
+            {"file": Path(d.file).name, "line": d.line, "code": d.code, "message": d.message}
+            for d in after_diags
+            if not _same_path(d.file, self.path) and d.category is not Category.ANNOTATION
+        ]
+        rose = [k for k, v in verdict.deltas.items() if v > 0]
+
+        return self._record("check_work", ToolResult(True, {
+            "verdict": "ACCEPTED" if verdict.accepted else "REJECTED",
+            "reason": verdict.reason,
+            "categories_that_rose": rose,
+            "errors_left_in_your_file": [
+                {"line": d.line, "code": d.code, "message": d.message} for d in mine
+            ],
+            # Capped: this is the tail of a package-wide check and an agent that
+            # receives 80 of someone else's errors will go and fix them.
+            "new_or_other_errors_elsewhere": elsewhere[:15],
         }))
 
 
-def _same_file(diagnostic: Any, path: Path) -> bool:
-    raw = diagnostic.get("file") if isinstance(diagnostic, dict) else getattr(diagnostic, "file", "")
+def _same_path(raw: str, path: Path) -> bool:
     try:
-        return Path(str(raw)).resolve() == path
+        return Path(raw).resolve() == path
     except OSError:
         return False
 
@@ -329,10 +395,11 @@ def work(
     target: str,
     path: str,
     diagnostics: Sequence[Classified],
+    before: Measurement | None = None,
     *,
-    max_turns: int = 8,
-    max_calls: int = 20,
-    keep_messages: int = 12,
+    max_turns: int = 20,
+    max_calls: int = 40,
+    keep_messages: int = 16,
 ) -> Trajectory:
     """Let the model fix `path` by calling tools, and report what it did.
 
@@ -342,7 +409,9 @@ def work(
 
     Both bounds are the caller's, not the model's. `max_turns` bounds the
     conversation, `max_calls` bounds the work, and they are separate because a
-    single turn can request several tools at once.
+    single turn can request several tools at once. They are set high because the
+    first measured failure mode was a trajectory that ran out of turns with work
+    still in flight, and an unfinished session scores the same as no session.
     """
     wrong = {d.category for d in diagnostics} - {Category.ANNOTATION}
     if wrong:
@@ -356,13 +425,20 @@ def work(
                           note=f"{read.error_type}: {read.error_message}")
     original = str(read.data["content"])
 
-    space = _Workspace(target, path, original)
+    baseline = before if before is not None else Measurement.of(from_result(run_mypy(target)))
+    space = _Workspace(target, path, original, baseline)
+
+    # The file is given rather than fetched. The first measured trajectory spent
+    # five of its eight turns re-reading a file it had already been shown, and never
+    # wrote anything. A tool call to obtain what the caller already holds is a round
+    # trip bought with the budget that was meant to do the work.
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _SYSTEM},
         {"role": "user", "content": (
-            f"File to fix: {path}\n"
-            f"Package root (for run_mypy): {target}\n\n"
-            f"mypy --strict reports:\n{_format(diagnostics)}"
+            f"File to fix: {path}\n\n"
+            f"mypy --strict reports these annotation errors in it:\n"
+            f"{_format(diagnostics)}\n\n"
+            f"--- BEGIN {Path(path).name} ---\n{original}\n--- END {Path(path).name} ---"
         )},
     ]
 
@@ -390,6 +466,13 @@ def work(
         })
         for call in reply.tool_calls:
             messages.append({"role": "tool", "tool_call_id": call.id, "content": space.run(call)})
+
+        # Stop the moment the real gate accepts. Continuing past acceptance can only
+        # lose it: every further edit is another chance to break something, and the
+        # session keeps the file as it stands at the end, not at its best moment.
+        if space.accepted:
+            stopped = "accepted"
+            break
 
         if len(space.steps) >= max_calls:
             stopped = "max_calls"
