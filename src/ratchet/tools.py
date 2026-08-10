@@ -142,3 +142,99 @@ def _tally(values: Iterable[str]) -> dict[str, int]:
     for v in values:
         out[v] = out.get(v, 0) + 1
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+#5 The schemas the model sees
+
+# Written by hand rather than generated from the signatures. The description is a
+# prompt, not documentation: it is the only place a constraint can be stated before
+# the model acts, and it needs wording chosen for a reader who will look for the
+# cheapest way to satisfy it. A generator would emit the type and drop exactly that.
+
+SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read a UTF-8 text file and return its exact contents. Read a file "
+                "before writing it, and read it again after writing if you need to "
+                "know what is actually on disk."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Path to an existing file."}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Overwrite an existing file with complete new contents. Cannot create "
+                "files. The write is checked before it lands: if it is rejected the "
+                "file on disk is unchanged and the reason is returned to you. A "
+                "rejected write is information, not a dead end. Fix the stated problem "
+                "and write again."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to an existing file."},
+                    "content": {
+                        "type": "string",
+                        "description": "The COMPLETE new file. Not a patch, not an excerpt.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_mypy",
+            "description": (
+                "Type-check with mypy --strict and return the diagnostics. Use this to "
+                "check your own work before you finish. Note that silencing a "
+                "diagnostic is not the same as fixing it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"target": {"type": "string", "description": "File or directory."}},
+                "required": ["target"],
+            },
+        },
+    },
+]
+
+TOOL_NAMES = frozenset(s["function"]["name"] for s in SCHEMAS)
+
+
+def as_json(result: ToolResult, *, limit: int = 8000) -> str:
+    """Render a ToolResult as the string handed back to the model.
+
+    Truncated by length because a tool result goes into the transcript and stays
+    there for the rest of the trajectory. One unbounded mypy dump costs its size on
+    every subsequent turn, not once. Truncation is announced rather than silent: a
+    model that cannot tell a short file from a clipped one will confidently rewrite
+    the half it can see and delete the half it cannot.
+    """
+    payload: dict[str, Any] = {"ok": result.ok}
+    if result.ok:
+        payload.update(result.data)
+    else:
+        payload["error"] = result.error_type
+        payload["message"] = result.error_message
+
+    body = json.dumps(payload, default=str)
+    if len(body) <= limit:
+        return body
+    return json.dumps({
+        "ok": result.ok,
+        "truncated": True,
+        "note": f"result was {len(body)} chars, showing the first {limit}",
+        "partial": body[:limit],
+    })
