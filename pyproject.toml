@@ -16,16 +16,16 @@ agent = [
   "langsmith>=0.1",
   "truststore>=0.9",
 ]
+# Referenced, not restated. These were two lists that had to stay identical, and
+# they did not: the agent extra moved from `openai` to `langchain` and `dev` kept
+# the old line, so CI type-checked without the libraries the source imports and
+# failed on a green local run.
 dev = [
+  "ratchet[agent]",
   "pytest>=8",
   "ruff>=0.6",
   "mypy>=1.11",
   "pre-commit>=3",
-  "openai>=1.40",
-  "langgraph>=1.0",
-  "langgraph-checkpoint-sqlite>=2.0",
-  "langsmith>=0.1",
-  "truststore>=0.9",
 ]
 
 [project.scripts]
