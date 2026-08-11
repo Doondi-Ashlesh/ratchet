@@ -24,6 +24,7 @@ from dataclasses import asdict
 from typing import Any
 
 from ratchet.bench import DirtyTree, NotAGitRepo, Trial, format_report, run_bench
+from ratchet.certs import use_os_certificates
 from ratchet.classify import Category, from_result, summary
 from ratchet.tools import run_mypy
 
@@ -151,29 +152,8 @@ def _run(args: argparse.Namespace) -> int:
     return EXIT_OK if kept or not results else EXIT_FOUND
 
 
-def _use_os_certificates() -> None:
-    """Verify TLS against the OS certificate store, process-wide.
-
-    Fixing this per-client was the instance fix and it did not hold: the OpenAI
-    client got a custom httpx context, and then LangSmith's uploader failed the
-    same way because it uses requests/urllib3 with certifi. Every future client
-    would have needed the same patch.
-
-    `inject_into_ssl()` patches the ssl module once, so anything in the process
-    verifying TLS picks up the OS store — including libraries that have not been
-    imported yet. Done here rather than on import because a library has no
-    business monkey-patching global ssl; an application does.
-    """
-    try:
-        import truststore
-
-        truststore.inject_into_ssl()
-    except ImportError:
-        pass
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    _use_os_certificates()
+    use_os_certificates()
     parser = argparse.ArgumentParser(
         prog="ratchet",
         description="A harness for long-running agents, built on a metric that only moves one way.",

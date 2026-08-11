@@ -13,8 +13,10 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from fake_model import FunctionModel
+from langchain_core.messages import AIMessage
 
-from ratchet import model
+from ratchet import llm
 from ratchet.agent import _unfence, propose
 from ratchet.classify import Category, Classified
 
@@ -34,7 +36,7 @@ def _never_call_a_live_model() -> Iterator[None]:
     """A test that forgets to clean up must not leak a fake into the next one —
     or worse, leave a real call enabled."""
     yield
-    model.set_completer(None)
+    llm.set_model(None)
 
 
 def _diag(
@@ -90,7 +92,7 @@ def test_a_missing_file_is_reported_not_raised(tmp_path: Path) -> None:
 def test_an_empty_response_is_reported(tmp_path: Path) -> None:
     p = tmp_path / "a.py"
     _write(p, CODE)
-    model.set_completer(lambda _: "   ")
+    llm.set_model(FunctionModel(fn=lambda _: "   "))
 
     out = propose(str(p), [_diag()])
 
@@ -102,7 +104,7 @@ def test_a_model_that_gave_up_is_reported_as_unchanged(tmp_path: Path) -> None:
     """Returning the file untouched is a real answer: it could not fix these."""
     p = tmp_path / "a.py"
     _write(p, CODE)
-    model.set_completer(lambda _: CODE)
+    llm.set_model(FunctionModel(fn=lambda _: CODE))
 
     out = propose(str(p), [_diag()])
 
@@ -113,7 +115,7 @@ def test_a_model_that_gave_up_is_reported_as_unchanged(tmp_path: Path) -> None:
 def test_a_real_edit_is_marked_changed(tmp_path: Path) -> None:
     p = tmp_path / "a.py"
     _write(p, CODE)
-    model.set_completer(lambda _: "```python\n" + FIXED + "```")
+    llm.set_model(FunctionModel(fn=lambda _: "```python\n" + FIXED + "```"))
 
     out = propose(str(p), [_diag()])
 
@@ -129,7 +131,7 @@ def test_the_prompt_carries_the_rules_the_errors_and_the_file(tmp_path: Path) ->
     p = tmp_path / "a.py"
     _write(p, CODE)
     seen: list[str] = []
-    model.set_completer(lambda prompt: seen.append(prompt) or FIXED)
+    llm.set_model(FunctionModel(fn=lambda prompt: seen.append(prompt) or FIXED))
 
     propose(str(p), [_diag(code="type-arg", line=7)])
     prompt = seen[0]
@@ -144,7 +146,7 @@ def test_errors_are_listed_in_line_order(tmp_path: Path) -> None:
     p = tmp_path / "a.py"
     _write(p, CODE)
     seen: list[str] = []
-    model.set_completer(lambda prompt: seen.append(prompt) or FIXED)
+    llm.set_model(FunctionModel(fn=lambda prompt: seen.append(prompt) or FIXED))
 
     propose(str(p), [_diag(line=9), _diag(line=2), _diag(line=5)])
     listed = [ln for ln in seen[0].splitlines() if ln.startswith("  line ")]
@@ -157,7 +159,7 @@ def test_the_rules_come_before_the_file(tmp_path: Path) -> None:
     p = tmp_path / "a.py"
     _write(p, CODE)
     seen: list[str] = []
-    model.set_completer(lambda prompt: seen.append(prompt) or FIXED)
+    llm.set_model(FunctionModel(fn=lambda prompt: seen.append(prompt) or FIXED))
 
     propose(str(p), [_diag()])
 
@@ -171,7 +173,7 @@ def test_a_proposal_adopts_the_files_line_endings(tmp_path: Path) -> None:
     three-line fix into a whole-file diff."""
     p = tmp_path / "a.py"
     p.write_bytes(CRLF_FILE)
-    model.set_completer(lambda _: "def f(x: int) -> int:\n    return x\n")
+    llm.set_model(FunctionModel(fn=lambda _: "def f(x: int) -> int:\n    return x\n"))
 
     out = propose(str(p), [_diag()])
 
@@ -185,7 +187,7 @@ def test_identical_content_in_different_endings_is_not_a_change(tmp_path: Path) 
     a full write-measure-reject cycle."""
     p = tmp_path / "a.py"
     p.write_bytes(CRLF_FILE)
-    model.set_completer(lambda _: "def f(x):\n    return x\n")
+    llm.set_model(FunctionModel(fn=lambda _: "def f(x):\n    return x\n"))
 
     assert propose(str(p), [_diag()]).changed is False
 
@@ -198,10 +200,16 @@ def test_a_truncated_response_is_reported_as_such(tmp_path: Path) -> None:
     p = tmp_path / "a.py"
     _write(p, CODE)
 
-    def cut_off(_: str) -> str:
-        raise model.Truncated("hit its output limit")
+    def cut_off(_: str) -> AIMessage:
+        # How a provider actually reports it: a normal response carrying a
+        # finish_reason. The old test raised an exception no provider raises,
+        # so it proved the harness handled a case that could not occur.
+        return AIMessage(
+            content="def f(x: int) -> in",
+            response_metadata={"finish_reason": "length"},
+        )
 
-    model.set_completer(cut_off)
+    llm.set_model(FunctionModel(fn=cut_off))
 
     out = propose(str(p), [_diag()])
 

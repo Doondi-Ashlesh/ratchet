@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from ratchet import model
+from langchain_core.callbacks import get_usage_metadata_callback
+
 from ratchet.classify import actionable, from_result
 from ratchet.session import run_agent_session, run_session
 from ratchet.tools import run_mypy
@@ -89,6 +91,13 @@ class BenchReport:
         return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
+def _totals(by_model: Mapping[str, Any]) -> tuple[int, int]:
+    """Input and output tokens summed across every model this trial used."""
+    inp = sum(int(v.get("input_tokens", 0) or 0) for v in by_model.values())
+    out = sum(int(v.get("output_tokens", 0) or 0) for v in by_model.values())
+    return inp, out
+
+
 def _git(root: Path, *args: str) -> str:
     proc = subprocess.run(
         ["git", "-C", str(root), *args], capture_output=True, text=True, check=False
@@ -151,20 +160,23 @@ def run_bench(
     trials: list[Trial] = []
 
     for path, codes, errors in _targets(target, max_files):
-        model.reset_usage()
         t0 = time.monotonic()
-        try:
-            result = (
-                run_session(target, path, max_attempts=max_attempts)
-                if mode == "single"
-                else run_agent_session(target, path)
-            )
-        finally:
-            # Restore regardless of outcome, including on a crash. Every trial has
-            # to start from the same baseline or the numbers mean nothing.
-            _git(root, "checkout", "--", path)
+        # Usage is collected by the framework rather than tallied by hand. The
+        # hand-written counter had to be told about every call site, and the agent
+        # loop's calls were invisible to it the moment they moved into middleware.
+        with get_usage_metadata_callback() as usage:
+            try:
+                result = (
+                    run_session(target, path, max_attempts=max_attempts)
+                    if mode == "single"
+                    else run_agent_session(target, path)
+                )
+            finally:
+                # Restore regardless of outcome, including on a crash. Every trial
+                # has to start from the same baseline or the numbers mean nothing.
+                _git(root, "checkout", "--", path)
 
-        used = model.usage()
+        used = _totals(usage.usage_metadata)
         trial = Trial(
             file=str(Path(path).resolve().relative_to(root)),
             codes=codes,
@@ -173,8 +185,8 @@ def run_bench(
             attempts=result.attempts,
             reason=result.reason,
             seconds=round(time.monotonic() - t0, 1),
-            tokens_in=used["input"],
-            tokens_out=used["output"],
+            tokens_in=used[0],
+            tokens_out=used[1],
         )
         trials.append(trial)
         if on_trial is not None:

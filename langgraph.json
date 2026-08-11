@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "ratchet": "./src/ratchet/studio.py:orchestrator"
+  },
+  "env": ".env"
+}
