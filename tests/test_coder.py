@@ -32,12 +32,24 @@ def _offline() -> Iterator[None]:
 
 
 def _repo(tmp_path: Path, files: dict[str, str]) -> str:
+    """A git repository with a commit in it.
+
+    The commit is not ceremony. Sessions run inside a worktree checked out from
+    HEAD, and a repository with no commits has no HEAD to check out, so an
+    uncommitted fixture would be testing a configuration the tool refuses.
+    """
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     for name, body in files.items():
         p = tmp_path / name
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("w", encoding="utf-8", newline="") as f:
             f.write(body)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t",
+         "commit", "-qm", "base"],
+        check=True,
+    )
     return str(tmp_path)
 
 

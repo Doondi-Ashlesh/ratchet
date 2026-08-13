@@ -10,12 +10,15 @@ The whole target is re-measured, not just the edited file. A change in one file
 can create errors in another, and a session that only checked its own file would
 happily export its mess to a neighbour and report success.
 
-The edit is applied in place and reverted on rejection, rather than being tested
-in a scratch copy. mypy resolves imports differently for an isolated file than for
-one inside its package, so a scratch measurement would answer a question nobody
-asked. The cost is a window where the file on disk is modified: the revert runs in
-a `finally`, and the target is a git repo, so `git checkout` is the backstop if
-the process is killed outright.
+The single-shot path applies its edit in place and reverts on rejection. The
+agentic path does not: it works inside a git worktree and copies the file back
+only once the gate accepts.
+
+The old objection to a scratch copy was that mypy resolves imports differently for
+an isolated file than for one inside its package, so measuring a copy would answer
+a question nobody asked. A worktree is not an isolated file. It is the whole
+repository at the same commit, so the oracle sees exactly what it would have seen
+in place, and rejection stops being a revert that a crash can interrupt.
 """
 from __future__ import annotations
 
@@ -23,12 +26,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from ratchet import sandbox
 from ratchet.agent import propose
 from ratchet.classify import Category, Classified, actionable, from_result
 from ratchet.coder import work as agent_work
 from ratchet.gate import Measurement, Verdict, judge
 from ratchet.guard import check as guard_check
-from ratchet.tools import read_file, run_mypy, write_file
+from ratchet.tools import run_mypy, write_file
 
 _NO_CHANGE: Mapping[str, int] = {c.value: 0 for c in Category}
 
@@ -195,27 +199,27 @@ def run_agent_session(
     trajectory already contains its own retries, and the model saw the guard's
     objection at the moment it was raised rather than one attempt later.
 
-    What does not change is the part that matters. The file is snapshotted before
-    the agent runs, the same gate judges the same measurement afterwards, and
-    anything short of an accepted verdict restores the snapshot byte for byte. The
-    agent is a different way of producing a candidate, not a different standard for
-    accepting one.
+    What does not change is the part that matters: the same gate judges the same
+    measurement, and only an accepted verdict reaches the caller's files.
+
+    The agent works inside a sandbox, so rejection is not a revert. Nothing was
+    written where it mattered, and the sandbox is deleted. That closes the window
+    the revert approach could never close - a crash, a kill, or a bug between the
+    write and the restore used to leave the caller's file modified, and the file
+    the agent was told not to touch was the caller's real one all along.
     """
-    before_diags = from_result(run_mypy(target))
-    before = Measurement.of(before_diags)
+    with sandbox.workspace(target) as box:
+        inner_path = box.inside(path)
 
-    todo = [c for c in actionable(before_diags) if _same_file(c.file, path)]
-    if not todo:
-        return _unchanged(path, "no annotation work in this file", before)
+        before_diags = from_result(run_mypy(box.target))
+        before = Measurement.of(before_diags)
 
-    read = read_file(path)
-    if not read.ok:
-        return _unchanged(path, f"{read.error_type}: {read.error_message}", before)
-    original = str(read.data["content"])
+        todo = [c for c in actionable(before_diags) if _same_file(c.file, inner_path)]
+        if not todo:
+            return _unchanged(path, "no annotation work in this file", before)
 
-    try:
         trajectory = agent_work(
-            target, path, todo, before,
+            box.target, inner_path, todo, before,
             max_model_calls=max_model_calls, max_tool_calls=max_tool_calls,
         )
 
@@ -227,22 +231,16 @@ def run_agent_session(
                 before, before, _NO_CHANGE, "", trajectory.steps, tuple(history),
             )
 
-        after_diags = from_result(run_mypy(target))
+        after_diags = from_result(run_mypy(box.target))
         after = Measurement.of(after_diags)
         verdict = judge(before, after, Category.ANNOTATION)
 
         if verdict.accepted:
-            return SessionResult(
-                path, True, verdict.reason, before, after, verdict.deltas,
-                trajectory.final, trajectory.steps, tuple(history),
-            )
+            # The only line in this function that touches the caller's repository,
+            # and it runs only after the gate has said yes.
+            box.promote(path)
 
-        write_file(path, original)
         return SessionResult(
-            path, False, verdict.reason, before, after, verdict.deltas,
+            path, verdict.accepted, verdict.reason, before, after, verdict.deltas,
             trajectory.final, trajectory.steps, tuple(history),
         )
-
-    except BaseException:
-        write_file(path, original)
-        raise
