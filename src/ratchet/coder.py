@@ -40,6 +40,14 @@ from ratchet.classify import Category, Classified
 from ratchet.gate import Measurement
 from ratchet.tools import read_file
 
+_NUDGES = 1
+
+_NUDGE = (
+    "You have not changed the file. Describing the fix is not the same as making it. "
+    "Call edit_file now with the exact text to replace, then call check_work. "
+    "If you genuinely believe no change is possible, call check_work and say so."
+)
+
 SYSTEM = """You are fixing missing type annotations in one Python file so that
 `mypy --strict` accepts it. You work by calling tools.
 
@@ -183,14 +191,25 @@ def work(
     )
 
     stopped, steps = "model", 0
+    # A message with no tool call reads as "finished" to an agent loop, and a model
+    # that narrates its plan instead of executing it produces exactly that. Measured
+    # live: three files in a row stopped after two steps having written nothing.
+    # Reasoning is off by default now, which removes the common cause, but the loop
+    # should not depend on a provider setting to notice that no work was done.
+    conversation: list[Any] = [task]
     try:
-        result = agent.invoke(
-            {"messages": [task]},
-            # A backstop only. The middleware limits above are the real bounds and
-            # end the loop cleanly; this catches a cycle they cannot see.
-            {"recursion_limit": 2 * (max_model_calls + max_tool_calls)},
-        )
-        steps = len(result.get("messages", ()))
+        for attempt in range(_NUDGES + 1):
+            result = agent.invoke(
+                {"messages": conversation},
+                # A backstop only. The middleware limits above are the real bounds and
+                # end the loop cleanly; this catches a cycle they cannot see.
+                {"recursion_limit": 2 * (max_model_calls + max_tool_calls)},
+            )
+            steps = len(result.get("messages", ()))
+            if session.wrote or session.accepted or attempt == _NUDGES:
+                break
+            stopped = "nudged"
+            conversation = [*result.get("messages", ()), HumanMessage(_NUDGE)]
     except GraphRecursionError:
         # Not an error condition. An agent that runs out of budget mid-repair has
         # produced a partial edit, and the gate judges whatever is on disk. Raising
@@ -200,6 +219,8 @@ def work(
         stopped = "error"
         session.record("model", False, f"{type(e).__name__}: {e}")
 
+    if session.wrote and stopped == "nudged":
+        stopped = "model"
     if session.accepted:
         stopped = "accepted"
 

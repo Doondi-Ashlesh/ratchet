@@ -48,6 +48,12 @@ class Session:
         return sum(1 for n, ok, _ in self.calls if n in ("edit_file", "write_file") and not ok)
 
     @property
+    def wrote(self) -> bool:
+        """Whether any edit actually landed. An agent that stops having written
+        nothing has not finished the task, whatever it says in its final message."""
+        return any(n in ("edit_file", "write_file") and ok for n, ok, _ in self.calls)
+
+    @property
     def self_checked(self) -> bool:
         return any(n == "check_work" for n, _, _ in self.calls)
 

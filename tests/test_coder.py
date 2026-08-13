@@ -198,3 +198,40 @@ def test_the_agent_cannot_name_another_file(tmp_path: Path) -> None:
 
     for tool in build_tools(session):
         assert "path" not in tool.args, f"{tool.name} exposes a path argument"
+
+
+def test_reasoning_is_off_by_default() -> None:
+    """A reasoning model returns its deliberation as content with no tool call, and
+    an agent loop reads that as 'finished'. Measured live: three files in a row
+    stopped after two steps having written nothing."""
+    from ratchet import llm
+
+    assert llm.thinking_enabled() is False
+
+
+def test_reasoning_can_be_turned_back_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whether deliberation helps on this task is measurable, so it stays a setting
+    rather than becoming a hard-coded assumption."""
+    from ratchet import llm
+
+    monkeypatch.setenv("RATCHET_THINKING", "on")
+    assert llm.thinking_enabled() is True
+
+
+def test_an_agent_that_writes_nothing_is_told_to_act(tmp_path: Path) -> None:
+    """The loop should not depend on a provider setting to notice no work was done.
+
+    A model that narrates its plan instead of executing it produces a message with
+    no tool call, which an agent loop reads as "finished". Measured live: three
+    files in a row stopped after two steps having written nothing.
+    """
+    target = _repo(tmp_path, {"a.py": UNTYPED})
+    path = str(tmp_path / "a.py")
+    model = ScriptedModel(replies=[says("I would add annotations to f.")])
+    llm.set_model(model)
+
+    result = run_agent_session(target, path)
+
+    assert model.seen > 1, "it was pushed to act rather than taken at its word"
+    assert not result.kept
+    assert Path(path).read_text(encoding="utf-8") == UNTYPED

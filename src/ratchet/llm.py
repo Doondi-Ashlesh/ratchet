@@ -16,6 +16,7 @@ Configure:
     NIM_BASE_URL            default https://integrate.api.nvidia.com/v1
     RATCHET_MODEL           default nvidia/nemotron-3-super-120b-a12b
     RATCHET_MODEL_ATTEMPTS  default 3
+    RATCHET_THINKING        default off
 """
 from __future__ import annotations
 
@@ -65,6 +66,16 @@ def base_url() -> str:
     return os.environ.get("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
 
+def thinking_enabled() -> bool:
+    """Whether the model deliberates before answering.
+
+    Off by default, and configurable rather than hard-coded because whether
+    reasoning helps on this task is a measurable question, not an opinion. Set
+    RATCHET_THINKING=on to benchmark the other side of it.
+    """
+    return os.environ.get("RATCHET_THINKING", "off").strip().lower() in {"on", "1", "true"}
+
+
 def attempts() -> int:
     """How many times a failed model call is retried. Read by the agent, which owns
     the retry policy."""
@@ -102,6 +113,23 @@ def chat_model(**overrides: Any) -> BaseChatModel:
         "base_url": base_url(),
         "temperature": 0,
     }
+
+    # Reasoning off by default, and this is not only a cost decision.
+    #
+    # Nemotron is a reasoning model. Left on, it returns its deliberation as the
+    # assistant's CONTENT with no tool call attached, and an agent loop reads a
+    # message with no tool call as "finished". Measured live: three files in a row
+    # reported "no change written" after two steps, because the model had narrated
+    # what it intended to do instead of doing it.
+    #
+    # The cost difference is the same size as the correctness one. On an identical
+    # prompt: 423 output tokens with reasoning on, 56 with it off.
+    #
+    # Passed as a plain keyword rather than `extra_body`, which this integration
+    # rejects. It is forwarded to the endpoint as a model kwarg, which is where NIM
+    # expects it.
+    settings["chat_template_kwargs"] = {"enable_thinking": thinking_enabled()}
+
     settings.update(overrides)
 
     model: BaseChatModel = ChatNVIDIA(**settings)
