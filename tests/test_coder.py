@@ -32,12 +32,24 @@ def _offline() -> Iterator[None]:
 
 
 def _repo(tmp_path: Path, files: dict[str, str]) -> str:
+    """A git repository with a commit in it.
+
+    The commit is not ceremony. Sessions run inside a worktree checked out from
+    HEAD, and a repository with no commits has no HEAD to check out, so an
+    uncommitted fixture would be testing a configuration the tool refuses.
+    """
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     for name, body in files.items():
         p = tmp_path / name
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("w", encoding="utf-8", newline="") as f:
             f.write(body)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t",
+         "commit", "-qm", "base"],
+        check=True,
+    )
     return str(tmp_path)
 
 
@@ -186,3 +198,40 @@ def test_the_agent_cannot_name_another_file(tmp_path: Path) -> None:
 
     for tool in build_tools(session):
         assert "path" not in tool.args, f"{tool.name} exposes a path argument"
+
+
+def test_reasoning_is_off_by_default() -> None:
+    """A reasoning model returns its deliberation as content with no tool call, and
+    an agent loop reads that as 'finished'. Measured live: three files in a row
+    stopped after two steps having written nothing."""
+    from ratchet import llm
+
+    assert llm.thinking_enabled() is False
+
+
+def test_reasoning_can_be_turned_back_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whether deliberation helps on this task is measurable, so it stays a setting
+    rather than becoming a hard-coded assumption."""
+    from ratchet import llm
+
+    monkeypatch.setenv("RATCHET_THINKING", "on")
+    assert llm.thinking_enabled() is True
+
+
+def test_an_agent_that_writes_nothing_is_told_to_act(tmp_path: Path) -> None:
+    """The loop should not depend on a provider setting to notice no work was done.
+
+    A model that narrates its plan instead of executing it produces a message with
+    no tool call, which an agent loop reads as "finished". Measured live: three
+    files in a row stopped after two steps having written nothing.
+    """
+    target = _repo(tmp_path, {"a.py": UNTYPED})
+    path = str(tmp_path / "a.py")
+    model = ScriptedModel(replies=[says("I would add annotations to f.")])
+    llm.set_model(model)
+
+    result = run_agent_session(target, path)
+
+    assert model.seen > 1, "it was pushed to act rather than taken at its word"
+    assert not result.kept
+    assert Path(path).read_text(encoding="utf-8") == UNTYPED

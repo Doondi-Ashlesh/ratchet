@@ -541,3 +541,103 @@ request, or it is not a retry.
 and the trajectory ended byte-identical to its start. The agent gained an action
 space and the ability to corrupt a file, and the checks written for the
 single-shot agent caught it on the first live run without modification.
+
+---
+
+## 025 · The agent was graded on a measurement it was not allowed to see
+
+**observed** — Two benchmark cells produced zero accepted sessions, and the
+rejections did not share a reason. The single-shot agent failed `nim.py` with
+`regressed: unknown +1` and `views.py` with `regressed: cascading +4, unknown +N`.
+Both had correctly fixed the annotations in the file they were given.
+
+**root cause** — Mine, and structural. `run_mypy` was exposed to the agent
+filtered to the file under work, to keep the transcript small. The gate measures
+the **whole package** and rejects if any category rises anywhere. Annotating a
+function makes its call sites checkable, so a correct annotation can surface
+errors in a neighbouring file the agent never saw.
+
+The agent was optimising one objective and being scored on another. No number of
+retries fixes that: the information required to succeed was never in the
+transcript. Every rejection of this shape was unwinnable by construction.
+
+**class fix** — `check_work` replaces the filtered oracle. It runs the real gate
+against the session's real baseline and returns the verdict that will actually be
+applied, the errors left in the agent's own file, and the new errors its edit
+caused elsewhere. What the agent optimises and what judges it are now the same
+computation, not two similar ones.
+
+**what this generalises to** — Any harness that shows an agent a summary while
+grading it on a fuller measure has this bug, and it looks like a competence
+problem in the agent. The check the agent can call must be the check that decides.
+
+---
+
+## 026 · A green local run failed in CI, because two dependency lists disagreed
+
+**observed** — Full suite, `ruff` and `mypy --strict` clean locally. CI failed
+immediately: `Cannot find implementation or library stub for module named
+"langchain_nvidia_ai_endpoints"`, plus two more of the same shape.
+
+**root cause** — CI installs `.[dev]`. The `dev` extra carried its own copy of the
+agent dependency list rather than referencing it. When the agent extra moved from
+`openai` to `langchain`, `dev` kept the stale line, so CI type-checked against
+libraries that were not installed. Locally both were present, which is precisely
+why local could not catch it.
+
+**class fix** — `dev` now depends on `ratchet[agent]`, so there is one list. A
+test asserts that relationship, because the next person to add a dependency would
+otherwise reintroduce it.
+
+**the pattern, third time now** — `--deadline` was wired into one of two
+`run_loop` call sites. The TLS fix was written per-client and only fixed one
+client (log 021). Two things that must stay identical eventually will not, and
+the fix is never to update the copy. It is to delete it.
+
+---
+
+## 027 · The model narrated its plan, and the loop called that finished
+
+**observed** — First benchmark of the sandboxed LangChain agent. Three files in a
+row, each with a single annotation error, reported `no change written (model, 2
+steps)` at roughly 3,000 tokens apiece. Accept rate 0/3, against 2/3 for
+single-shot on the identical files.
+
+**first wrong diagnosis** — It looked like the sandbox had broken path mapping, so
+the agent was being pointed at a file that did not exist or had nothing to fix.
+It was not. `todo` was non-empty in every case, and a missing file would have
+reported `no annotation work`, not `no change written`.
+
+**root cause** — The trace showed the model returning several hundred words of
+deliberation as the assistant message's **content**, with no tool call attached:
+
+```
+"Now, let's split the content by newline and count lines. ...
+ So the two errors are likely: line 84: the parameter `messages`..."
+```
+
+Nemotron is a reasoning model. An agent loop treats a message with no tool call as
+the final answer, so the loop ended while the model was still thinking out loud.
+It never got as far as being wrong about the task.
+
+**class fix** — Two, because either alone leaves the failure reachable.
+
+Reasoning is off by default. On an identical prompt: `423` output tokens with it
+on, `56` with it off. It stays configurable through `RATCHET_THINKING`, because
+whether deliberation helps *this* task is measurable and not yet measured.
+
+More importantly, the loop no longer accepts "stopped having written nothing" as
+done. A trajectory that ends with no edit landed is told so once and asked to act.
+That check belongs to the harness: any model can narrate instead of acting, and
+noticing it should not depend on a provider setting being correct.
+
+**a note on plumbing** — `extra_body` is the documented way to pass this through
+an OpenAI-compatible client, and `ChatNVIDIA` rejects it with a 400. The flag has
+to go through as a plain model kwarg instead. Swapping to a maintained library
+removes the code you own; it does not remove the need to know what it does.
+
+**the cost went up, and that was the point** — With the early stop removed, the
+hardest file went from 8 steps and 27k tokens to 30 steps and 207k. It still did
+not fix the file. But an agent that quits after two steps has a cheap accept rate
+that means nothing, and the first metric that matters is whether the work gets
+finished at all.
