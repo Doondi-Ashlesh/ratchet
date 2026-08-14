@@ -118,8 +118,8 @@ def _format(diagnostics: Sequence[Classified]) -> str:
     )
 
 
-class StopWhenAccepted(AgentMiddleware[Any, Any]):
-    """End the run as soon as `check_work` reports the gate would accept.
+class StopWhenSettled(AgentMiddleware[Any, Any]):
+    """End the run once the outcome is decided, either way.
 
     Without this the agent keeps going until it exhausts its step budget, and it
     was measured doing exactly that: every file in one benchmark target ran to the
@@ -130,9 +130,15 @@ class StopWhenAccepted(AgentMiddleware[Any, Any]):
     trajectory ends, not as it stood at its best moment, so every step taken after
     acceptance is a fresh chance to lose it and no chance to gain anything.
 
-    Checked before the model is called rather than after: the acceptance happened
+    Checked before the model is called rather than after: the outcome changed
     during a tool call, and the next model call is precisely the spend this exists
     to avoid.
+
+    The stalled case is the same argument pointing the other way. Two files in one
+    benchmark looped to the recursion limit and spent 389k and 96k tokens producing
+    no change at all. Repeated checks showing an unmoved error count is the agent
+    telling you it has run out of ideas; continuing only spends money to hear it
+    again.
     """
 
     def __init__(self, session: Session) -> None:
@@ -141,7 +147,7 @@ class StopWhenAccepted(AgentMiddleware[Any, Any]):
 
     @hook_config(can_jump_to=["end"])
     def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        if self.session.accepted:
+        if self.session.accepted or self.session.stalled:
             return {"jump_to": "end"}
         return None
 
@@ -160,8 +166,8 @@ def _middleware(session: Session, max_model_calls: int, max_tool_calls: int) -> 
     requested it still carries the reasoning.
     """
     return [
-        # First, so an accepted trajectory stops before anything else spends.
-        StopWhenAccepted(session),
+        # First, so a settled trajectory stops before anything else spends.
+        StopWhenSettled(session),
         # An unattended run makes hundreds of calls, and a rate limit or a slow
         # response is a normal event at that volume. Without this, one of them ends
         # the run and discards every session that already succeeded. Jitter matters:
@@ -251,6 +257,14 @@ def work(
         stopped = "error"
         session.record("model", False, f"{type(e).__name__}: {e}")
 
+    # The message count is unavailable when the loop ended by exception, and
+    # reporting zero made those results unreadable: a run that spent 389k tokens
+    # showed up in the same column as one that did nothing. Tool calls are a
+    # truthful floor for what happened.
+    steps = steps or len(session.calls)
+
+    if session.stalled and stopped not in ("accepted", "error"):
+        stopped = "stalled"
     if session.wrote and stopped == "nudged":
         stopped = "model"
     if session.accepted:
