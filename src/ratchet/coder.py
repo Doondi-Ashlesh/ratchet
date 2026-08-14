@@ -25,12 +25,14 @@ from typing import Any
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
+    AgentMiddleware,
     ClearToolUsesEdit,
     ContextEditingMiddleware,
     ModelCallLimitMiddleware,
     ModelRetryMiddleware,
     ToolCallLimitMiddleware,
 )
+from langchain.agents.middleware.types import hook_config
 from langchain_core.messages import HumanMessage
 from langgraph.errors import GraphRecursionError
 
@@ -116,7 +118,35 @@ def _format(diagnostics: Sequence[Classified]) -> str:
     )
 
 
-def _middleware(max_model_calls: int, max_tool_calls: int) -> list[Any]:
+class StopWhenAccepted(AgentMiddleware[Any, Any]):
+    """End the run as soon as `check_work` reports the gate would accept.
+
+    Without this the agent keeps going until it exhausts its step budget, and it
+    was measured doing exactly that: every file in one benchmark target ran to the
+    ceiling AFTER already succeeding, at 669k tokens against 15.8k for a
+    single-shot prompt producing the same result.
+
+    Cost is the smaller half. The session keeps the file as it stands when the
+    trajectory ends, not as it stood at its best moment, so every step taken after
+    acceptance is a fresh chance to lose it and no chance to gain anything.
+
+    Checked before the model is called rather than after: the acceptance happened
+    during a tool call, and the next model call is precisely the spend this exists
+    to avoid.
+    """
+
+    def __init__(self, session: Session) -> None:
+        super().__init__()
+        self.session = session
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        if self.session.accepted:
+            return {"jump_to": "end"}
+        return None
+
+
+def _middleware(session: Session, max_model_calls: int, max_tool_calls: int) -> list[Any]:
     """The bounds and the context policy, as middleware.
 
     `exit_behavior="end"` on both limits matters. The alternative raises, and an
@@ -130,6 +160,8 @@ def _middleware(max_model_calls: int, max_tool_calls: int) -> list[Any]:
     requested it still carries the reasoning.
     """
     return [
+        # First, so an accepted trajectory stops before anything else spends.
+        StopWhenAccepted(session),
         # An unattended run makes hundreds of calls, and a rate limit or a slow
         # response is a normal event at that volume. Without this, one of them ends
         # the run and discards every session that already succeeded. Jitter matters:
@@ -180,7 +212,7 @@ def work(
         llm.chat_model(),
         tools=build_tools(session),
         system_prompt=SYSTEM,
-        middleware=_middleware(max_model_calls, max_tool_calls),
+        middleware=_middleware(session, max_model_calls, max_tool_calls),
     )
 
     task = HumanMessage(

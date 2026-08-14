@@ -18,6 +18,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+LF = "\n"
+CR = "\r"
+CRLF = "\r\n"
+
 
 @dataclass(frozen=True)
 class Diagnostic:
@@ -63,6 +67,12 @@ def write_file(path: str, content: str) -> ToolResult:
     return ToolResult(True, {"path": str(p), "bytes": len(content)})
 
 
+def _match_newlines(text: str, like: str) -> str:
+    """Rewrite `text` to use the line endings of `like`."""
+    body = text.replace(CRLF, LF).replace(CR, LF)
+    return body.replace(LF, CRLF) if CRLF in like else body
+
+
 def replace_once(content: str, old: str, new: str) -> tuple[str, ToolResult]:
     """Anchored replacement. Refuses anything it cannot place unambiguously.
 
@@ -83,7 +93,25 @@ def replace_once(content: str, old: str, new: str) -> tuple[str, ToolResult]:
         return content, ToolResult(
             False, error_type="no_op", error_message="old_string and new_string are identical")
 
-    found = content.count(old)
+    # The anchor is rewritten to the file's own line endings before matching.
+    #
+    # Without this the tool is unusable on a CRLF repository, and silently so. A
+    # model is shown the file, quotes a passage back with `\n`, and a literal
+    # comparison against `\r\n` content never matches - so every multi-line anchor
+    # fails with "does not appear in the file", which reads as the model being
+    # unable to copy text. Measured: 11 of 16 edits failed this way, every one
+    # `not_found`, on targets that were 100% CRLF.
+    #
+    # The anchor is converted rather than the file. Normalising the content would
+    # rewrite line endings in regions nobody edited, turning a two-line change into
+    # a whole-file diff on exactly the repositories this is meant to support.
+    anchor, replacement = _match_newlines(old, content), _match_newlines(new, content)
+
+    found = content.count(anchor)
+    if found == 0 and anchor != old:
+        # A file with mixed endings: this region may not use the dominant one.
+        anchor, replacement, found = old, new, content.count(old)
+
     if found == 0:
         return content, ToolResult(
             False, error_type="not_found",
@@ -93,7 +121,7 @@ def replace_once(content: str, old: str, new: str) -> tuple[str, ToolResult]:
             False, error_type="not_unique",
             error_message=f"old_string appears {found} times; include surrounding lines to make it unique")
 
-    return content.replace(old, new, 1), ToolResult(True, {"replacements": 1})
+    return content.replace(anchor, replacement, 1), ToolResult(True, {"replacements": 1})
 
 
 #3 Oracle :mypy tool
