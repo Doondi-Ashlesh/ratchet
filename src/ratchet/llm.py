@@ -17,6 +17,8 @@ Configure:
     RATCHET_MODEL           default nvidia/nemotron-3-super-120b-a12b
     RATCHET_MODEL_ATTEMPTS  default 3
     RATCHET_THINKING        default off
+    RATCHET_TIMEOUT_S       default 300
+    RATCHET_MAX_TOKENS      default 8192
 """
 from __future__ import annotations
 
@@ -76,6 +78,26 @@ def thinking_enabled() -> bool:
     return os.environ.get("RATCHET_THINKING", "off").strip().lower() in {"on", "1", "true"}
 
 
+def timeout_s() -> float:
+    """Seconds to wait for one model call.
+
+    The replacement library defaults to 60, which is not enough: a single agent
+    turn on a real file routinely runs longer, and the failure looks like the
+    endpoint being unreachable rather than a deadline being too short.
+    """
+    return float(os.environ.get("RATCHET_TIMEOUT_S", "300"))
+
+
+def max_tokens() -> int:
+    """Output budget for one call.
+
+    The replacement library defaults to 1024. A whole-file write does not fit in
+    that, and a response cut off mid-file is indistinguishable from a model that
+    cannot write Python (log 019).
+    """
+    return int(os.environ.get("RATCHET_MAX_TOKENS", "8192"))
+
+
 def attempts() -> int:
     """How many times a failed model call is retried. Read by the agent, which owns
     the retry policy."""
@@ -130,7 +152,26 @@ def chat_model(**overrides: Any) -> BaseChatModel:
     # expects it.
     settings["chat_template_kwargs"] = {"enable_thinking": thinking_enabled()}
 
+    # Both of these were configured on the old hand-written client and were lost in
+    # the swap, because the replacement has its own defaults and neither is a
+    # constructor argument. Measured cost of the loss: 30 of 80 model calls in one
+    # benchmark failed with `Read timed out. (read timeout=60)`, which surfaced as
+    # sessions that burned ten minutes, reported zero tokens, and wrote nothing.
+    #
+    # The lesson is not "restore the settings". Adopting a library means adopting
+    # its defaults, and the defaults it ships are the ones its usual callers want,
+    # not necessarily the ones the previous code had.
+    settings["max_tokens"] = max_tokens()
     settings.update(overrides)
 
-    model: BaseChatModel = ChatNVIDIA(**settings)
-    return model
+    model = ChatNVIDIA(**settings)
+
+    # `timeout` is not a field on the chat model; it lives on the client underneath,
+    # where 60s is the default. Set after construction because there is no
+    # constructor path to it. Private attribute, so it is asserted in the tests: if
+    # a future version moves it, the suite should say so rather than the next
+    # benchmark quietly losing a third of its calls again.
+    model._client.timeout = timeout_s()
+
+    checked: BaseChatModel = model
+    return checked

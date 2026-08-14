@@ -235,3 +235,27 @@ def test_an_agent_that_writes_nothing_is_told_to_act(tmp_path: Path) -> None:
     assert model.seen > 1, "it was pushed to act rather than taken at its word"
     assert not result.kept
     assert Path(path).read_text(encoding="utf-8") == UNTYPED
+
+
+def test_the_model_gets_a_workable_timeout_and_output_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both settings were lost in the library swap and cost 30 of 80 calls in one
+    benchmark, which surfaced as sessions that ran ten minutes, reported zero
+    tokens and wrote nothing.
+
+    The timeout lives on a private client attribute because there is no
+    constructor path to it. Asserted here so that a future version moving it fails
+    the suite rather than quietly losing a third of the next run's calls.
+    """
+    from ratchet import llm
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    llm.set_model(None)
+
+    model = llm.chat_model()
+
+    assert model._client.timeout == llm.timeout_s()  # type: ignore[attr-defined]
+    assert model._client.timeout >= 300  # type: ignore[attr-defined]
+    assert model.max_tokens == llm.max_tokens()  # type: ignore[attr-defined]
+    assert model.max_tokens >= 8192  # type: ignore[attr-defined]

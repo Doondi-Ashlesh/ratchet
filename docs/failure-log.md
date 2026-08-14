@@ -641,3 +641,119 @@ hardest file went from 8 steps and 27k tokens to 30 steps and 207k. It still did
 not fix the file. But an agent that quits after two steps has a cheap accept rate
 that means nothing, and the first metric that matters is whether the work gets
 finished at all.
+
+---
+
+## 028 · Adopting a library means adopting its defaults
+
+**observed** — Benchmark of the sandboxed agent. One cell reported a file as
+`no change written` after **510 seconds and zero tokens**. Zero tokens with eight
+minutes on the clock is not a model being unhelpful; it is a model that was never
+successfully reached.
+
+LangSmith showed **30 of 80 runs in that project had errored**, all identically:
+
+```
+ReadTimeout(ReadTimeoutError("... Read timed out. (read timeout=60)"))
+```
+
+**root cause** — The old hand-written client read `RATCHET_TIMEOUT_S`, defaulting
+to 300 seconds, set after a run died on a slow response (log 019). `ChatNVIDIA`
+has its own default of 60, and `timeout` is not a field on the chat model at all:
+it lives on the client underneath, reachable only after construction. The swap
+deleted the old setting and nothing replaced it, so more than a third of every
+call was being cut off at a minute.
+
+The same swap silently reintroduced an output cap. `ChatNVIDIA` defaults
+`max_tokens` to **1024**, which does not hold a whole-file write, and a response
+cut off mid-file is exactly the failure log 019 was written about.
+
+**class fix** — Both are configured again, and the private-attribute one is
+asserted in a test, so a future version moving it fails the suite rather than the
+next benchmark quietly losing a third of its calls.
+
+**the actual lesson** — Not "restore the settings". Every one of these settings
+existed because a previous run failed, and each was recorded in this log. Swapping
+to a maintained library is the right call, and it silently reset that accumulated
+configuration to somebody else's defaults, which are the ones their usual callers
+want rather than the ones this project had learned it needed.
+
+A library swap is not only a code change. It is a reset of every default the code
+was compensating for, and the failure log is the list of what to check.
+
+**what held** — Nothing incorrect was accepted. The gate rejected every affected
+session, so the cost was time and tokens rather than bad code in the repository.
+And the failure was legible: the tracing added in log 022 is the only reason
+"zero tokens in 510 seconds" was a question with an answer instead of a shrug.
+
+---
+
+## 029 · The agent was not bad at editing; the comparison was
+
+**observed** — Across a four-target benchmark the agent kept exhausting its step
+budget without finishing. Tool-call breakdown from the traces:
+
+```
+check_work        39
+edit_file         16      <- 11 of these failed
+read_current_file 11
+```
+
+Every one of the eleven failures was `not_found`: *"old_string does not appear in
+the file"*. The agent was spending most of its budget re-reading and re-checking
+rather than editing, and single-shot prompting was beating it.
+
+**first wrong diagnosis** — That a 120B reasoning model was the wrong tool for
+mechanical edits, and the fix was a second, code-specialist model to apply what
+the reasoner decided. It is a real pattern and it was the wrong call here. It
+would have added an architecture change on top of an unfixed bug, and made the
+next measurement uninterpretable.
+
+**root cause** — One line, and not the model at all:
+
+```python
+found = content.count(old)
+```
+
+Every target file was **100% CRLF**. The model is shown the file, quotes a passage
+back using `LF`, and a literal comparison against `CRLF` content cannot match. Any
+anchor spanning more than one line failed — not usually, never. The agent had been
+doing the task correctly and being told the text it had just been shown did not
+exist.
+
+**class fix** — The anchor is rewritten to the file's line-ending convention
+before matching. The anchor is converted, not the file: normalising the content
+would rewrite endings in regions nobody edited, turning a two-line change into a
+whole-file diff on exactly the repositories this needs to support. A mixed-ending
+file falls back to the raw anchor. Absent and ambiguous anchors are still refused,
+because the fix must not quietly become a fuzzy match.
+
+The tests now use CRLF fixtures throughout. An LF-only suite is what let this
+through, and it would have let the next one through too.
+
+**effect**
+
+```
+edit failures     11/16  ->  0/16
+orchestrator       2/3   ->  3/3      386k -> 56k tokens, 3246s -> 118s
+nvidiaapi          3/3   ->  3/3      669k -> 32k tokens, 1940s ->  61s
+```
+
+`nim.py` had been failed by single-shot and by every previous agent
+configuration. It now passes.
+
+**what this generalises to** — A harness bug that only affects the agent's tools
+is indistinguishable, from the outside, from a model that is bad at its job. The
+symptom was "the model cannot copy text accurately", the evidence was consistent
+with it, and the conclusion would have been to change models. What separated the
+two was reading the actual tool results rather than the accept rate.
+
+Before concluding that a model is incapable, check that the thing it is being
+judged on is a fair test.
+
+**what did not improve** — The totals across all four targets are 7/10 for both
+modes, with the agent 5.5x more expensive. Two files now fail by looping to the
+recursion limit and spending 389k and 96k tokens producing no change at all. With
+edits landing, the failure has moved from "cannot act" to "acts without checking":
+16 edits against 2 `check_work` calls in one trajectory. That is the next entry,
+not a resolved one.
