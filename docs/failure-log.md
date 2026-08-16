@@ -757,3 +757,75 @@ recursion limit and spending 389k and 96k tokens producing no change at all. Wit
 edits landing, the failure has moved from "cannot act" to "acts without checking":
 16 edits against 2 `check_work` calls in one trajectory. That is the next entry,
 not a resolved one.
+
+---
+
+## 030 · The agent was not stuck, it was unsupervised
+
+**observed** — With anchored edits finally landing (log 029), two files in one
+target still failed, and failed expensively:
+
+```
+sdk_agent/catalog.py    no progress: annotation 76 -> 76    389k tokens
+sdk_agent/graph.py      no progress: annotation 76 -> 76     96k tokens
+```
+
+One file was 45% of the whole benchmark's token bill and changed nothing. Both
+ended in `GraphRecursionError`, and both reported `0` steps, so at a glance they
+were indistinguishable from sessions that had done nothing at all.
+
+**root cause** — Trace breakdown of one such trajectory: **16 `edit_file` calls
+against 2 `check_work` calls**. The agent edited, edited, edited, and almost never
+looked at the result. With nothing to correct against, it wandered until the
+recursion limit ended it.
+
+The system prompt already said, in a numbered procedure, to call `check_work`
+after every edit. It was followed twice out of sixteen. This is log 013's rule
+arriving in a new costume: *a prompt is a request; only a check is enforcement.*
+
+**class fix** — The pacing rule moved out of the prompt and into the tool. After
+three edits without verifying, the next edit is refused with a reason the agent
+can act on, and nothing reaches the file. The budget resets on every `check_work`,
+so this paces the work rather than capping it.
+
+Separately, a trajectory that verifies three times and sees an unmoved annotation
+count is stopped. Staleness is judged on the count rather than on the verdict,
+because a session can be rejected for several different reasons while still making
+real progress; an unmoved count across three checks is the agent saying it has run
+out of ideas, and continuing only pays to hear it again.
+
+**effect**
+
+```
+                     before          after
+catalog.py     0 steps, 389k    KEPT, 27 steps, 201k
+graph.py       0 steps,  96k    rejected cleanly, 20 steps, 105k
+total          7/10 accepted    8/10 accepted
+```
+
+The 389k-token file that produced nothing now fixes its errors. The agent was
+never incapable of it; it had no mechanism forcing it to look at its own work.
+
+`graph.py` still fails, but it now fails *legibly*: twenty steps and a real
+verdict, instead of silently consuming budget until a framework limit intervened.
+
+**what this generalises to** — Four consecutive failures in this project were read
+as "the model is not good enough at this task", and all four were the harness:
+a 60-second default timeout, a reasoning mode that returned narration instead of
+tool calls, a byte comparison that could never match, and now a missing feedback
+loop. Each one produced behaviour that looked exactly like incompetence.
+
+The tell is the same every time. Model limitations degrade gracefully and vary
+between runs; harness bugs fail identically every time, which is what makes them
+look like a model that simply cannot do something.
+
+**what did not improve** — Every remaining failure is one shape: the agent's
+annotations make previously unchecked code checkable, real errors appear
+elsewhere, and the gate refuses because no category may rise. Whether that work is
+correct and the gate is too strict on files carrying a lot of hidden debt is still
+unverified, and is the open question.
+
+Cost is also still roughly 5x single-shot for a 1-file accuracy gain. Pacing added
+overhead to files that were already converging, because a forced `check_work` runs
+mypy across the package. That was the intended trade and it should be measured
+rather than assumed.

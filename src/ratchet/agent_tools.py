@@ -28,6 +28,19 @@ from ratchet.gate import Measurement, judge
 from ratchet.guard import check as guard_check
 from ratchet.tools import read_file, replace_once, run_mypy, write_file
 
+# How many edits may land before the agent has to look at what they did.
+#
+# Not a style preference. Measured: one trajectory made 16 edits against 2
+# check_work calls, looped to the recursion limit and spent 389k tokens producing
+# no change at all. An agent that edits without verifying has no way to discover
+# it is off course until its budget is gone.
+EDITS_BEFORE_CHECK = 3
+
+# How many consecutive checks may show no improvement before the run is stopped.
+# Three checks is at least three edits each, so this is not impatience; it is the
+# difference between working and thrashing.
+CHECKS_WITHOUT_PROGRESS = 3
+
 
 class Session:
     """One file's worth of permission, and the record of what was done with it."""
@@ -39,6 +52,8 @@ class Session:
         self.before = before
         self.calls: list[tuple[str, bool, str]] = []
         self.accepted = False
+        self.edits_since_check = 0
+        self.checks: list[int] = []      # annotation count seen at each check_work
 
     def record(self, name: str, ok: bool, detail: str = "") -> None:
         self.calls.append((name, ok, detail))
@@ -56,6 +71,25 @@ class Session:
     @property
     def self_checked(self) -> bool:
         return any(n == "check_work" for n, _, _ in self.calls)
+
+    @property
+    def must_check(self) -> bool:
+        """Whether an edit should be refused until the agent verifies."""
+        return self.edits_since_check >= EDITS_BEFORE_CHECK
+
+    @property
+    def stalled(self) -> bool:
+        """Whether repeated verification has shown no movement at all.
+
+        Judged on the annotation count rather than on the verdict, because a
+        trajectory can be rejected for several different reasons while still making
+        progress. Identical counts across this many checks means the edits in
+        between changed nothing the oracle can see.
+        """
+        if self.accepted or len(self.checks) < CHECKS_WITHOUT_PROGRESS:
+            return False
+        recent = self.checks[-CHECKS_WITHOUT_PROGRESS:]
+        return len(set(recent)) == 1
 
 
 def _fail(session: Session, name: str, error: str, message: str) -> str:
@@ -78,6 +112,16 @@ def build_tools(session: Session) -> list[BaseTool]:
 
     def _apply(name: str, candidate: str) -> str:
         """Guard, then write. The only path to disk, so no tool routes around it."""
+        if session.must_check:
+            # Enforced here rather than asked for in the prompt. The prompt already
+            # says to check after every edit, and a trajectory was measured making
+            # 16 edits against 2 checks anyway. A request is not a constraint.
+            return _fail(
+                session, name, "verify_first",
+                f"you have made {session.edits_since_check} edits without checking; "
+                f"call check_work before editing again",
+            )
+
         verdict = guard_check(session.original, candidate)
         if not verdict.ok:
             # The write never lands. The model is told why, in the same words the
@@ -88,6 +132,7 @@ def build_tools(session: Session) -> list[BaseTool]:
         written = write_file(str(session.path), candidate)
         if not written.ok:
             return _fail(session, name, written.error_type, written.error_message)
+        session.edits_since_check += 1
         return _ok(session, name, {"bytes": written.data.get("bytes", 0)})
 
     @tool
@@ -141,6 +186,8 @@ def build_tools(session: Session) -> list[BaseTool]:
         after = Measurement.of(after_diags)
         verdict = judge(session.before, after, Category.ANNOTATION)
         session.accepted = verdict.accepted
+        session.edits_since_check = 0
+        session.checks.append(after.get(Category.ANNOTATION))
 
         mine = [d for d in after_diags if _same(d.file, session.path)]
         elsewhere = [
