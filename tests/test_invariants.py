@@ -295,3 +295,34 @@ def test_a_renamed_import_is_tracked_by_the_name_it_binds() -> None:
     after = "def f(x: int) -> int:\n    return pd.DataFrame(x)\n"
 
     assert not check(before, after).ok
+
+
+# ── the message has to be actionable ─────────────────────────────────────────
+
+
+def test_a_rewritten_statement_is_named_not_just_refused() -> None:
+    """A guard that says "something other than annotations changed" has told the
+    agent it failed and nothing else. Measured: one trajectory hit that message
+    three times, guessed differently each time, and spent 438k tokens without
+    fixing a single error."""
+    result = check(PLAIN, PLAIN.replace("return x", "return x + 1"))
+
+    assert not result.ok
+    assert "return x" in result.reason
+    assert "return x + 1" in result.reason
+
+
+def test_an_added_statement_points_at_where_it_appeared() -> None:
+    result = check(PLAIN, PLAIN.replace("    return x", "    print(x)\n    return x"))
+
+    assert not result.ok
+    assert "print(x)" in result.reason
+
+
+def test_a_removed_import_names_the_binding() -> None:
+    before = "import os\n\n\ndef f(x):\n    return os.getcwd()\n"
+    after = "def f(x: int) -> str:\n    return os.getcwd()\n"
+    result = check(before, after)
+
+    assert not result.ok
+    assert "os" in result.reason

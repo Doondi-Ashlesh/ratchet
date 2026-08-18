@@ -371,22 +371,62 @@ def _explain(before: ast.Module, after: ast.Module) -> list[str]:
     return said
 
 
+def _skeleton_lines(tree: ast.Module) -> list[str]:
+    """The stripped program as source lines, for pointing at what moved."""
+    stripped = _StripAnnotations().visit(tree)
+    stripped.body = [
+        s for s in stripped.body
+        if not _is_import(s) and not _is_type_checking_block(s)
+    ]
+    return ast.unparse(ast.fix_missing_locations(stripped)).splitlines()
+
+
+def _what_changed(before: ast.Module, after: ast.Module) -> str:
+    """Name the first statement that differs, in the model's own terms.
+
+    A guard that says "something other than annotations changed" has told the
+    agent it failed and nothing else. Measured: one trajectory hit that message
+    three times, guessing differently each time, and spent 438k tokens without
+    fixing a single error.
+
+    Both sides are stripped of annotations and unparsed, so the comparison is on
+    the code the annotations describe. The first line that differs is where the
+    proposal stopped being an annotation edit.
+    """
+    was = _skeleton_lines(ast.parse(ast.unparse(before)))
+    now = _skeleton_lines(ast.parse(ast.unparse(after)))
+
+    for old_line, new_line in zip(was, now, strict=False):
+        if old_line != new_line:
+            return f"you changed `{old_line.strip()}` into `{new_line.strip()}`"
+
+    if len(now) > len(was):
+        return f"you added `{now[len(was)].strip()}`"
+    if len(was) > len(now):
+        return f"you removed `{was[len(now)].strip()}`"
+    return ""
+
+
 def _only_annotations_changed(before: ast.Module, after: ast.Module) -> list[str]:
     lost = _imports(before) - _imports(after)
     if lost:
-        return ["you removed an import; imports may be added but never removed"]
+        name = min(lost)
+        return [f"you removed the import of `{name}`; imports may be added but never removed"]
 
     # Parsed twice because the transformer mutates in place, and the other
     # invariants need the original trees intact.
     if _skeleton(ast.parse(ast.unparse(before))) == _skeleton(ast.parse(ast.unparse(after))):
         return []
 
-    generic = (
-        "you changed something other than annotations and imports. Only type "
-        "annotations may be added or corrected: no statement, docstring, name or "
-        "piece of logic may be added, removed or rewritten"
+    rule = (
+        "only type annotations may be added or corrected; no statement, docstring, "
+        "name or piece of logic may be added, removed or rewritten"
     )
-    return _explain(before, after) or [generic]
+    changed = _what_changed(before, after)
+    detail = _explain(before, after) or ([changed] if changed else [])
+    if detail:
+        return [f"{d}. Undo that: {rule}" for d in detail]
+    return [f"you changed something other than annotations and imports. Note that {rule}"]
 
 
 def _no_new_partial_annotations(before: ast.Module, after: ast.Module) -> list[str]:
