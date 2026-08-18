@@ -26,7 +26,12 @@ CLEAN = "x: int = 1\n"
 
 # Fixes the annotation error and introduces an undefined name in its place:
 # annotation 1 -> 0, unknown 0 -> 1, total unchanged. The gate must refuse this.
-SIDEWAYS_FIX = "def f(x: int) -> int:\n    return nope\n"
+# Annotation-only on purpose. It has to reach the GATE, and rewriting a
+# statement no longer does: the guard refuses anything that is not an annotation
+# edit before a measurement is ever taken. `Nope` is undefined, so this trades an
+# annotation error for a name error, which is exactly the trade the gate exists
+# to refuse.
+SIDEWAYS_FIX = "def f(x: Nope) -> Nope:\n    return x\n"
 
 
 @pytest.fixture(autouse=True)
@@ -161,7 +166,7 @@ def test_a_rejected_attempt_is_retried_with_feedback(tmp_path: Path) -> None:
     assert result.attempts == 2
     assert len(result.history) == 1                 # one rejection, recorded
     assert "REJECTED" in prompts[1]                 # attempt 2 was told it failed
-    assert "nope" in prompts[1]                     # and told the specific error
+    assert "Nope" in prompts[1]                     # and told the specific error
 
 
 def test_each_attempt_starts_from_the_original_file(tmp_path: Path) -> None:
