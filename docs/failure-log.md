@@ -829,3 +829,106 @@ Cost is also still roughly 5x single-shot for a 1-file accuracy gain. Pacing add
 overhead to files that were already converging, because a forced `check_work` runs
 mypy across the package. That was the intended trade and it should be measured
 rather than assumed.
+
+---
+
+## 031 · The guard stopped enumerating damage
+
+**observed** — The guard had grown one rule per incident: removed defs, removed
+docstrings, `# type: ignore`, bare `Any`, then bare `object`. Every one was added
+after something got through. A denylist is always one incident behind, and the
+next incident arrived on schedule.
+
+A proposal for `views.py` added `-> None` to two functions and left their
+parameters unannotated. It passed every rule the guard had. It fixed 18 errors,
+introduced 12, four of them real defects, and the gate refused it.
+
+**root cause** — Half-annotating a function is worse than not annotating it. mypy
+skips the body of an untyped function; give it a return type and the body becomes
+checkable, and attributes assigned `None` in a constructor are then inferred as
+`None`. The errors that appeared were not latent bugs revealed. They were created
+by the shape of the edit.
+
+**class fix** — The guard now states what an annotation edit is ALLOWED to be,
+rather than listing what it must not do:
+
+1. **Only annotations may change.** Strip every annotation from both sides; the
+   remaining trees must be identical. Imports may be added, because an annotation
+   can need one.
+2. **No function may become partially annotated.**
+3. **No annotation may be vacuous** — `Any`, `object`, and now bare `None`.
+4. **Nothing may be suppressed** — `# type: ignore`, and now `# noqa`.
+
+Rule 1 carries the weight. It subsumes every preservation check that came before
+it, because deleted functions, deleted docstrings, rewritten logic and changed
+runtime behaviour are all "something other than an annotation changed". It cannot
+be evaded by a form of damage nobody has thought of, since it does not enumerate
+damage.
+
+**two things the rewrite got wrong, both caught by testing on real output**
+
+The first version compared import *statements*. The same proposal added `Any` to
+an existing `from typing import Dict, List, Optional`, which rewrites that line,
+so the original read as deleted and a correct edit was refused. Imports are now
+compared by the names they bind. A rail that cries wolf is a rail people route
+around.
+
+The second was worse and took a live run to find. The invariant rejected
+correctly and explained nothing: "you changed something other than annotations".
+One trajectory hit that message three times, guessed differently each time, and
+spent **438k tokens without fixing a single error**. The guard's own docstring
+claims it can say what went wrong in terms the next attempt can act on, and for
+this class it could not. It now names the first differing statement: *you changed
+`return x` into `return x + 1`*.
+
+The general shape: an invariant that is correct and unactionable is only half
+built. Enforcement decides what is rejected; the message decides whether the next
+attempt is any better than the last.
+
+---
+
+## 032 · Three runs, three different files, the same score
+
+**observed** — Three benchmark runs of near-identical code all scored 8/10. The
+per-file view says something else entirely:
+
+```
+file                     single    v7     v8     v9
+orchestrator/nim.py        drop   keep   keep   keep
+recommender/views.py       drop   drop   keep   drop
+sdk_agent/catalog.py       keep   keep   drop   keep
+sdk_agent/graph.py         drop   drop   drop   drop
+(six other files)          keep   keep   keep   keep
+```
+
+Two files flip between runs. The other eight never move. The score is stable and
+what produces it is not.
+
+**what this invalidates** — Claims made in this log and in commit messages from
+single runs. `views.py` was reported as the invariants finally working; it failed
+on the next run under the same rules. `catalog.py` was reported as the invariants
+costing a file; it came back without any relevant change. Both were single
+samples of a high-variance process, presented as effects.
+
+Log 013 recorded that temperature 0 is not determinism, at the level of one
+completion. This is the same fact at the level of a whole trajectory: twenty
+steps of compounding choices, where an early divergence changes everything after
+it. The variance is concentrated entirely on the files that require judgement.
+Files with one obvious annotation are stable across every run.
+
+**what survives** — Two claims, because they hold in every run rather than one:
+
+`nim.py` fails under single-shot and passes under the agent in v7, v8 and v9.
+That is the accuracy gain, and it is one file.
+
+Wall clock went 3835s to 325s across the same runs, monotonically, an 11.8x
+speedup over single-shot with tokens down 15%. Cost improvements have been
+consistent in a way accuracy has not.
+
+**method fix** — One trial per cell is a sample, not a measurement. Comparisons
+need repeat runs and a distribution, because the noise on the interesting files
+is currently larger than any change made to the harness. Until that exists, a
+change that moves one hard file cannot be distinguished from luck.
+
+`graph.py` is the only honest constant: it has never passed, in any
+configuration, including single-shot.
