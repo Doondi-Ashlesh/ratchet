@@ -4,8 +4,6 @@
 
 A harness for long-running LLM agents, built around a progress metric that can only move one way.
 
-The first thing it drives is `mypy --strict` on a Python codebase, one file per session, because that gives an objective oracle and a number that is hard to fake.
-
 ---
 
 ## The problem
